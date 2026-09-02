@@ -261,6 +261,73 @@ def leave_family(user_id: int):
     return family_id
 
 
+# ---------- Транзакции ----------
+
+def add_transaction(user_id: int, amount: float, tx_type: str, category: str, source: str, comment: str = ""):
+    family_id = get_family_id(user_id)
+    res = db.table("transactions").insert(
+        {
+            "user_id": user_id,
+            "family_id": family_id,
+            "amount": amount,
+            "type": tx_type,
+            "category": category,
+            "source": source,
+            "comment": comment,
+        }
+    ).execute()
+    return res.data[0]
+
+
+def get_last_transaction(user_id: int):
+    res = (
+        db.table("transactions")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("is_deleted", False)
+        .order("date_time", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
+def soft_delete_transaction(tx_id: int):
+    db.table("transactions").update({"is_deleted": True}).eq("id", tx_id).execute()
+
+
+def _scope_filter(query, user_id: int, family_id: int | None):
+    """Если юзер в семье — берём все транзакции семьи, иначе только свои."""
+    return query.eq("family_id", family_id) if family_id else query.eq("user_id", user_id)
+
+
+def get_transactions_since(user_id: int, since: datetime):
+    family_id = get_family_id(user_id)
+    query = db.table("transactions").select("*").eq("is_deleted", False).gte("date_time", since.isoformat())
+    query = _scope_filter(query, user_id, family_id)
+    res = query.order("date_time", desc=True).execute()
+    return res.data
+
+
+def get_report(user_id: int, since: datetime):
+    rows = get_transactions_since(user_id, since)
+    income = sum(r["amount"] for r in rows if r["type"] == "income")
+    expense = sum(r["amount"] for r in rows if r["type"] == "expense")
+
+    by_category: dict[str, float] = {}
+    for r in rows:
+        if r["type"] == "expense":
+            by_category[r["category"]] = by_category.get(r["category"], 0) + r["amount"]
+    top5 = sorted(by_category.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    return {"income": income, "expense": expense, "balance": income - expense, "top5": top5}
+
+
+def get_history(user_id: int, days: int):
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    return get_transactions_since(user_id, since)
+
+
 # ---------- Зеркало транзакций (tx_mirror) ----------
 # Читает/пишет только если таблица tx_mirror создана в Supabase (см.
 # schema.sql). Если её нет или Supabase недоступен — все функции тихо

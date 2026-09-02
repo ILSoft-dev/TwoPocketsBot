@@ -1,46 +1,18 @@
 """
 insights.py
-v1.7 - чат-вопросы по уже накопленным данным ("сколько потратил на корм в
+v1.4 - чат-вопросы по уже накопленным данным ("сколько потратил на корм в
 июне?", "какой пробег у матиза за август?", "когда менял масло на опеле?",
-"сколько мороженого я купил?", "сколько раз я покупал мороженое?", "средний
-чек в кафе?", "на что я больше всего трачу в продуктах?", "трачу больше,
-чем в прошлом месяце?"), плюс уточняющие вопросы без повтора темы ("Сколько
-на сахар в июле?" -> "А в августе?" — см. _get_previous_question).
+"сколько мороженого я купил?").
 
 Архитектура: LLM (groq_client.parse_question) только РАЗБИРАЕТ вопрос в
 структурированный запрос — категорию/машину/период. Сам ответ считает наш
-код по данным из Sheets, без всякой фантазии модели в цифрах. Единственное
-исключение — breakdown: там ЕЩЁ ОДИН LLM-вызов (cluster_items) группирует
-похожие описания трат в товары, но суммы по группам всё равно считает код.
+код по данным из Sheets, без всякой фантазии модели в цифрах.
 
 Разрешение года для месяца без явного года — правило "самый недавний
 прошедший такой месяц": если месяц уже был в этом году — берём этот год,
 если ещё не наступил — прошлый год. Явно названный год всегда побеждает.
 
 Changelog:
-- v1.7: _get_previous_question/_remember_question — память последнего
-        разобранного вопроса в Redis, 10 минут (QUESTION_MEMORY_TTL_SECONDS).
-        Была задокументирована для пользователей, но кода не существовало
-        вообще ни в каком виде — восстановлено с нуля. Запоминаются только
-        УСПЕШНО разобранные вопросы (intent != unknown, parsed is not
-        None) — не подставляем мусорный контекст под следующий вопрос.
-- v1.6: три новых способа спросить про деньги.
-        (1) intent=average ("средний чек в кафе?") — сумма/число_покупок за
-        период, переиспользует новый _compute_money.
-        (2) intent=breakdown ("на что я больше всего трачу в продуктах?")
-        — разбивка ОДНОЙ категории на товары через groq_client.cluster_items
-        + группировку сумм в коде.
-        (3) compare_previous ("трачу больше, чем в прошлом месяце?") —
-        применяется поверх spending/income, считает текущий И предыдущий
-        период (resolve_previous_period) и показывает разницу/%. all_time
-        сравнивать не с чем — отдельное сообщение вместо тихой ошибки.
-        _answer_money отрефакторен на общее ядро _compute_money (сумма,
-        число_записей, ошибка) — average/comparison его переиспользуют.
-- v1.5: intent=count ("сколько раз я покупал мороженое?") — считает
-        количество ЗАПИСЕЙ (транзакций), не сумму денег (spending) и не
-        сумму поля Количество (quantity, "сколько мороженого"). Проще всех
-        трёх — не зависит от того, распознано ли физическое количество в
-        принципе, каждая подходящая запись = одна покупка.
 - v1.4: _answer_last_date получила _guess_auto_keyword() — детерминированный
         фоллбэк на СЫРОМ тексте вопроса (те же основы, что
         auto_expense.FUEL_KEYWORDS/REPAIR_KEYWORDS/MAINTENANCE_KEYWORDS
@@ -74,51 +46,17 @@ Changelog:
         категории, как в _answer_money, но берём первую (самую свежую)
         строку вместо суммы.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from calendar import monthrange
-import json
+import asyncio
 import logging
-
-import redis.asyncio as redis_asyncio
 
 import supabase_client as db
 import cars
 import auto_expense
 import groq_client
-from config import REDIS_URL
 from report import period_start
 from sheets_transactions import get_transactions_in_range, to_float, NoGoogleAccount
-
-# Память последнего РАЗОБРАННОГО вопроса пользователя — для уточняющих
-# вопросов без повтора темы ("Сколько на сахар в июле?" -> "А в августе?").
-# Тот же клиент/паттерн, что уже использует narrative_report.py.
-_redis = redis_asyncio.from_url(REDIS_URL)
-QUESTION_MEMORY_TTL_SECONDS = 600  # 10 минут
-
-
-async def _get_previous_question(user_id: int) -> dict | None:
-    try:
-        raw = await _redis.get(f"last_question:{user_id}")
-    except Exception:
-        logging.exception("_get_previous_question: Redis read failed")
-        return None
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-
-async def _remember_question(user_id: int, text: str, parsed: dict) -> None:
-    try:
-        await _redis.set(
-            f"last_question:{user_id}",
-            json.dumps({"text": text, "parsed": parsed}, ensure_ascii=False),
-            ex=QUESTION_MEMORY_TTL_SECONDS,
-        )
-    except Exception:
-        logging.exception("_remember_question: Redis write failed")
 
 MONTH_NAMES = {
     1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
@@ -161,31 +99,6 @@ def resolve_period(period_type: str, month: int | None, year: int | None,
     return None, None, "всё время"
 
 
-def resolve_previous_period(period_type: str, month: int | None, year: int | None,
-                            month_start_day: int) -> tuple[datetime | None, datetime | None, str | None]:
-    """Период, ПРЕДШЕСТВУЮЩИЙ тому, что вернул бы resolve_period с теми же
-    аргументами — для intent'ов с compare_previous. Третий элемент — None,
-    если сравнивать не с чем (all_time), вызывающий код должен это
-    проверить и не звать _answer_comparison в этом случае."""
-    if period_type == "specific_month" and month:
-        actual_year = resolve_year_for_month(month, year)
-        prev_month = month - 1 or 12
-        prev_year = actual_year if month > 1 else actual_year - 1
-        since, until = month_bounds(prev_year, prev_month)
-        label = f"{MONTH_NAMES.get(prev_month, prev_month)} {prev_year}"
-        return since, until, label
-
-    if period_type == "current_period":
-        since = period_start(month_start_day)
-        prev_month = since.month - 1 or 12
-        prev_year = since.year if since.month > 1 else since.year - 1
-        prev_since = since.replace(year=prev_year, month=prev_month)
-        prev_until = since - timedelta(seconds=1)
-        return prev_since, prev_until, "прошлый период"
-
-    return None, None, None
-
-
 async def answer_question(user_id: int, text: str) -> str:
     """Никогда не поднимает исключение наружу — любой сбой (сеть,
     Supabase, Groq) превращается в вежливое сообщение, а не в тишину."""
@@ -197,11 +110,11 @@ async def answer_question(user_id: int, text: str) -> str:
 
 
 async def _answer_question_inner(user_id: int, text: str) -> str:
-    user = db.get_user_by_id(user_id)
+    user = await asyncio.to_thread(db.get_user_by_id, user_id)
     if not user:
         return "Не нашёл твой профиль — попробуй /start."
 
-    account = db.get_effective_google_account(user_id)
+    account = await asyncio.to_thread(db.get_effective_google_account, user_id)
     active_cars = []
     if account:
         try:
@@ -209,11 +122,10 @@ async def _answer_question_inner(user_id: int, text: str) -> str:
         except Exception:
             active_cars = []  # не критично для вопросов не про машины
 
-    categories = [c["name"] for c in db.get_categories(user_id)]
+    categories = [c["name"] for c in await asyncio.to_thread(db.get_categories, user_id)]
     car_names = [c["Машина"] for c in active_cars]
 
-    previous = await _get_previous_question(user_id)
-    parsed = groq_client.parse_question(text, categories, car_names, previous=previous)
+    parsed = await asyncio.to_thread(groq_client.parse_question, text, categories, car_names)
     if parsed is None:
         return (
             "Не понял вопрос 🤔 Попробуй переформулировать, например: "
@@ -227,12 +139,6 @@ async def _answer_question_inner(user_id: int, text: str) -> str:
             "Не понял, о чём вопрос — про траты, доходы, пробег или "
             "\"когда\"? Попробуй переформулировать."
         )
-
-    # Запоминаем только УСПЕШНО разобранные вопросы — на 10 минут, для
-    # следующего уточняющего ("а в августе?"). Неудачный разбор/unknown не
-    # запоминаем: подставлять мусорный контекст под следующий вопрос хуже,
-    # чем не подставлять никакой.
-    await _remember_question(user_id, text, parsed)
 
     # last_date ("когда я в последний раз...") по смыслу не ограничен
     # отчётным периодом — сознательно НЕ вызывает resolve_period, ищет по
@@ -253,32 +159,6 @@ async def _answer_question_inner(user_id: int, text: str) -> str:
     if intent == "quantity":
         return await _answer_quantity(user_id, parsed.get("category"), parsed.get("item"),
                                       since, until, label)
-
-    if intent == "count":
-        return await _answer_count(user_id, parsed.get("category"), parsed.get("item"),
-                                   since, until, label)
-
-    if intent == "breakdown":
-        return await _answer_breakdown(user_id, parsed.get("category"), since, until, label,
-                                       user.get("currency", "RUB"))
-
-    # compare_previous применим только к деньгам (spending/income) — вопрос
-    # про количество/среднее "больше, чем в прошлом" не просили, не гадаем.
-    if intent in ("spending", "income") and parsed.get("compare_previous"):
-        prev_since, prev_until, prev_label = resolve_previous_period(
-            parsed.get("period_type", "current_period"),
-            parsed.get("month"), parsed.get("year"),
-            user.get("month_start", 1),
-        )
-        if prev_label is None:
-            return "Не с чем сравнивать — «за всё время» не имеет предыдущего периода. Уточни конкретный месяц или период."
-        return await _answer_comparison(user_id, intent, parsed.get("category"), parsed.get("item"),
-                                        since, until, label, prev_since, prev_until, prev_label,
-                                        user.get("currency", "RUB"))
-
-    if intent == "average":
-        return await _answer_average(user_id, parsed.get("category"), parsed.get("item"),
-                                     since, until, label, user.get("currency", "RUB"))
 
     return await _answer_money(user_id, intent, parsed.get("category"), parsed.get("item"),
                                since, until, label, user.get("currency", "RUB"))
@@ -366,38 +246,6 @@ async def _answer_quantity(user_id: int, category: str | None, item: str | None,
     return result
 
 
-async def _answer_count(user_id: int, category: str | None, item: str | None,
-                        since, until, label: str) -> str:
-    """"Сколько раз я покупал мороженое?" — считает КОЛИЧЕСТВО ЗАПИСЕЙ
-    (транзакций), а не сумму денег (intent=spending) и не сумму поля
-    Количество (intent=quantity, "сколько мороженого"). В отличие от
-    quantity, тут Количество/Единица вообще не нужны — каждая подходящая
-    запись == одна покупка, независимо от того, было ли в ней распознано
-    физическое количество."""
-    keyword = item or category
-    if not keyword:
-        return "Не понял, что именно считать — назови товар или категорию."
-
-    try:
-        rows = await get_transactions_in_range(user_id, since, until)
-    except NoGoogleAccount:
-        return "Google Drive не подключён — пройди заново /start."
-    except Exception:
-        return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
-
-    expense_rows = [r for r in rows if r["Тип"] == "expense"]
-    if item:
-        matching = [r for r in expense_rows if _item_matches(item, str(r.get("Комментарий", "")))]
-    else:
-        matching = [r for r in expense_rows if r["Категория"] == category]
-
-    if not matching:
-        return f"Не нашёл покупок «{keyword}» за {label}."
-
-    word = _plural_ru(len(matching), "раз", "раза", "раз")
-    return f"За {label} «{keyword}»: {len(matching)} {word}."
-
-
 def _guess_auto_keyword(text: str) -> str | None:
     """Детерминированный фоллбэк на СЫРОМ тексте вопроса, когда LLM не
     вернула item (ненадёжна для глагольных формулировок вроде "заправлял
@@ -430,18 +278,14 @@ async def _answer_last_date(user_id: int, account: dict | None, car_name: str | 
         if not keyword:
             keyword = _guess_auto_keyword(question_text)
         try:
-            event, count = await cars.get_last_auto_event(account, car_name, keyword)
+            event = await cars.get_last_auto_event(account, car_name, keyword)
         except Exception:
             return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
         if event is None:
             subject = f" «{keyword}»" if keyword else ""
             return f"Не нашёл записей{subject} по «{car_name}»."
         if keyword:
-            date_part = f"Последний раз {keyword} на «{car_name}»: {_format_date(event['Дата'])}"
-            if count > 1:
-                word = _plural_ru(count, "раз", "раза", "раз")
-                return f"{date_part} (всего {count} {word})."
-            return f"{date_part}."
+            return f"Последний раз {keyword} на «{car_name}»: {_format_date(event['Дата'])}."
         # Не разобрал, ЧТО именно спрашивают про машину (item пустой) —
         # не выдаём это за ответ по существу молча: показываем, что реально
         # нашли (последнее событие ЛЮБОГО типа), и просим уточнить.
@@ -470,11 +314,7 @@ async def _answer_last_date(user_id: int, account: dict | None, car_name: str | 
     ]
     if not matching:
         return f"Не нашёл трат «{keyword}»."
-    date_part = f"Последний раз «{keyword}»: {_format_date(matching[0]['Дата и время'])}"
-    if len(matching) > 1:
-        word = _plural_ru(len(matching), "раз", "раза", "раз")
-        return f"{date_part} (всего {len(matching)} {word})."
-    return f"{date_part}."
+    return f"Последний раз «{keyword}»: {_format_date(matching[0]['Дата и время'])}."
 
 
 def _item_matches(item: str, text: str) -> bool:
@@ -490,26 +330,14 @@ def _item_matches(item: str, text: str) -> bool:
     return item_lower[:stem_len] in text_lower
 
 
-def _money_subject(category: str | None, item: str | None) -> str:
-    if item:
-        return f" на «{item}»"
-    if category:
-        return f" на «{category}»"
-    return ""
-
-
-async def _compute_money(user_id: int, intent: str, category: str | None, item: str | None,
-                         since, until) -> tuple[float | None, int, str | None]:
-    """Общее ядро для _answer_money/_answer_average/_answer_comparison —
-    считает (сумма, число_записей, ошибка). ошибка не None, если что-то
-    пошло не так на уровне доступа к Sheets — тогда сумму/число игнорировать
-    и просто вернуть ошибку пользователю как есть."""
+async def _answer_money(user_id: int, intent: str, category: str | None, item: str | None,
+                        since, until, label: str, currency: str) -> str:
     try:
         rows = await get_transactions_in_range(user_id, since, until)
     except NoGoogleAccount:
-        return None, 0, "Google Drive не подключён — пройди заново /start."
+        return "Google Drive не подключён — пройди заново /start."
     except Exception:
-        return None, 0, "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
+        return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
 
     tx_type = "income" if intent == "income" else "expense"
     filtered = [r for r in rows if r["Тип"] == tx_type]
@@ -520,136 +348,20 @@ async def _compute_money(user_id: int, intent: str, category: str | None, item: 
     # по всей категории "Продукты", как это было до фикса).
     if item:
         filtered = [r for r in filtered if _item_matches(item, str(r.get("Комментарий", "")))]
+        subject = f" на «{item}»"
     elif category:
         filtered = [r for r in filtered if r["Категория"] == category]
+        subject = f" на «{category}»"
+    else:
+        subject = ""
 
     total = sum(to_float(r["Сумма"]) for r in filtered)
-    return total, len(filtered), None
-
-
-async def _answer_money(user_id: int, intent: str, category: str | None, item: str | None,
-                        since, until, label: str, currency: str) -> str:
-    total, count, error = await _compute_money(user_id, intent, category, item, since, until)
-    if error:
-        return error
-
     verb = "доход" if intent == "income" else "расход"
-    subject = _money_subject(category, item)
+    cat_part = subject
 
-    if count == 0:
-        return f"За {label}{subject} {verb}ов не нашёл."
-    return f"За {label}{subject}: {verb} {total:g} {currency} ({count} записей)."
-
-
-async def _answer_average(user_id: int, category: str | None, item: str | None,
-                          since, until, label: str, currency: str) -> str:
-    """"Сколько в среднем трачу на кофе?" / "средний чек в кафе?" — сумма
-    делённая на число ПОКУПОК за период (не на число дней — "средний чек"
-    по смыслу это "средняя сумма ОДНОЙ покупки", не дневная трата)."""
-    total, count, error = await _compute_money(user_id, "spending", category, item, since, until)
-    if error:
-        return error
-
-    subject = _money_subject(category, item)
-    if count == 0:
-        return f"За {label}{subject} трат не нашёл — нечего усреднять."
-
-    avg = total / count
-    return (
-        f"За {label}{subject}: в среднем {avg:g} {currency} за покупку "
-        f"({count} записей, всего {total:g} {currency})."
-    )
-
-
-async def _answer_comparison(user_id: int, intent: str, category: str | None, item: str | None,
-                             since, until, label: str,
-                             prev_since, prev_until, prev_label: str, currency: str) -> str:
-    """"В этом месяце я трачу больше, чем в прошлом?" — тот же intent
-    spending/income, но считаем ДВАЖДЫ (текущий и предыдущий период) и
-    показываем разницу. all_time сравнивать не с чем — отдельная проверка
-    в вызывающем коде (_answer_question_inner) до сюда не доходит."""
-    cur_total, cur_count, error = await _compute_money(user_id, intent, category, item, since, until)
-    if error:
-        return error
-    prev_total, prev_count, error = await _compute_money(
-        user_id, intent, category, item, prev_since, prev_until
-    )
-    if error:
-        return error
-
-    verb = "доход" if intent == "income" else "расход"
-    subject = _money_subject(category, item)
-    diff = cur_total - prev_total
-
-    if prev_total == 0:
-        pct_text = "" if diff == 0 else " (в прошлом периоде записей не было)"
-    else:
-        pct = diff / prev_total * 100
-        pct_text = f" ({'+' if pct >= 0 else ''}{pct:.0f}%)"
-    sign = "+" if diff >= 0 else ""
-
-    return (
-        f"{label}{subject}: {verb} {cur_total:g} {currency} ({cur_count} записей).\n"
-        f"{prev_label}{subject}: {verb} {prev_total:g} {currency} ({prev_count} записей).\n"
-        f"Разница: {sign}{diff:g} {currency}{pct_text}."
-    )
-
-
-async def _answer_breakdown(user_id: int, category: str | None,
-                            since, until, label: str, currency: str) -> str:
-    """"На что я больше всего трачу в продуктах?" — разбивка ОДНОЙ
-    категории на товары. Комментарий — свободный текст ("молоко"/"молоко
-    2.5%"/"молочко" — три разные строки), поэтому группировку по смыслу
-    делает groq_client.cluster_items (отдельный LLM-вызов), а суммы и
-    сортировку — наш код, как и везде."""
-    if not category:
-        return "Уточни категорию — разбивка по товарам считается ВНУТРИ одной категории."
-
-    try:
-        rows = await get_transactions_in_range(user_id, since, until)
-    except NoGoogleAccount:
-        return "Google Drive не подключён — пройди заново /start."
-    except Exception:
-        return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
-
-    matching = [r for r in rows if r["Тип"] == "expense" and r["Категория"] == category]
-    if not matching:
-        return f"Нет трат в категории «{category}» за {label}."
-
-    comments = [str(r.get("Комментарий", "")).strip() or "без описания" for r in matching]
-    unique_comments = sorted(set(comments))
-
-    try:
-        grouping = groq_client.cluster_items(unique_comments)
-    except Exception:
-        logging.exception("_answer_breakdown: cluster_items failed")
-        grouping = None
-    if not grouping:
-        # Фоллбэк — без группировки, по буквальному тексту комментария.
-        # Хуже (не сольёт "молоко"/"молоко 2.5%"), но не роняет ответ.
-        grouping = {c: c for c in unique_comments}
-
-    totals: dict[str, float] = {}
-    counts: dict[str, int] = {}
-    for row, comment in zip(matching, comments):
-        group = grouping.get(comment, comment)
-        totals[group] = totals.get(group, 0) + to_float(row["Сумма"])
-        counts[group] = counts.get(group, 0) + 1
-
-    top = sorted(totals.items(), key=lambda kv: -kv[1])[:8]
-    lines = [f"Разбивка «{category}» за {label}:"]
-    for name, total in top:
-        cnt = counts[name]
-        word = _plural_ru(cnt, "раз", "раза", "раз")
-        lines.append(f"• {name}: {total:g} {currency} ({cnt} {word})")
-
-    if len(unique_comments) > groq_client.MAX_CLUSTER_ITEMS:
-        lines.append(
-            f"\n(⚠️ уникальных описаний больше {groq_client.MAX_CLUSTER_ITEMS} — "
-            f"часть могла попасть в группу «как есть», без объединения)"
-        )
-
-    return "\n".join(lines)
+    if not filtered:
+        return f"За {label}{cat_part} {verb}ов не нашёл."
+    return f"За {label}{cat_part}: {verb} {total:g} {currency} ({len(filtered)} записей)."
 
 
 async def _answer_mileage(account: dict | None, car_name: str | None,
