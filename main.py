@@ -9,17 +9,18 @@ from aiogram.types import BotCommand
 from aiohttp import web
 
 from config import BOT_TOKEN, REDIS_URL, PORT, CRON_SECRET, SUPABASE_KEEPALIVE_INTERVAL_SECONDS, redis_connection_kwargs
+from middlewares import PinMiddleware
 from google_oauth_web import oauth_callback
 import supabase_client as db
-import sheets_transactions as tx
-import narrative_report
 import reminders
 import car_stats
+import narrative_report
 
 # Роутеры — порядок важен! Команды и FSM-специфичные хендлеры должны
 # регистрироваться РАНЬШЕ input_handler (там generic F.text/F.voice/F.photo,
 # который иначе перехватит любое сообщение, включая команды).
 import start
+import pin_auth
 import report
 import history
 import categories
@@ -28,7 +29,6 @@ import settings
 import undo
 import cars_command
 import car_stats_command
-import resync
 import input_handler
 
 logging.basicConfig(level=logging.INFO)
@@ -44,8 +44,7 @@ BOT_COMMANDS = [
     BotCommand(command="family", description="👨‍👩‍👧 Семейный бюджет"),
     BotCommand(command="cars", description="🚗 Машины: список, добавить, удалить"),
     BotCommand(command="carstats", description="📈 Статистика по машине"),
-    BotCommand(command="settings", description="⚙️ Валюта, период"),
-    BotCommand(command="resync", description="🔄 Пересобрать кэш из Google-таблицы"),
+    BotCommand(command="settings", description="⚙️ Валюта, период, PIN"),
 ]
 
 
@@ -54,26 +53,20 @@ async def health_check(request):
 
 
 async def daily_cron(request: web.Request) -> web.Response:
-    """Одна ежедневная задача вместо нескольких: напоминания о пробеге
-    (раз в неделю на машину — reminders.py сам решает, кому пора),
-    ежемесячная статистика (car_stats.py сам решает, у кого сегодня конец
-    периода), сверка зеркала транзакций (tx_mirror) с реальным Sheets —
-    страховка от тихого расхождения, см. sheets_transactions.py changelog
-    v1.4 — и годовой отчёт (narrative_report.py сам решает, что сегодня
-    1 января, иначе сразу возвращает 0). Один пинг UptimeRobot закрывает
-    всё сразу."""
+    """Одна ежедневная задача вместо трёх: напоминания о пробеге (раз в
+    неделю на машину — reminders.py сам решает, кому пора), ежемесячная
+    статистика (car_stats.py сам решает, у кого сегодня конец периода) и
+    годовой отчёт (narrative_report.py — сработает только 1 января, во все
+    остальные дни run_annual_report_sweep — no-op). Один пинг UptimeRobot
+    закрывает все три."""
     if CRON_SECRET and request.query.get("secret") != CRON_SECRET:
         return web.Response(status=403, text="forbidden")
     bot = request.app["bot"]
     reminders_sent = await reminders.run_reminder_sweep(bot)
     stats_sent = await car_stats.run_monthly_stats_sweep(bot)
-    mirrors_fixed = await tx.run_mirror_reconcile_sweep()
     annual_sent = await narrative_report.run_annual_report_sweep(bot)
     return web.Response(
-        text=(
-            f"ok, reminders_sent={reminders_sent}, stats_sent={stats_sent}, "
-            f"mirrors_fixed={mirrors_fixed}, annual_sent={annual_sent}"
-        )
+        text=f"ok, reminders_sent={reminders_sent}, stats_sent={stats_sent}, annual_sent={annual_sent}"
     )
 
 
@@ -125,7 +118,11 @@ async def main():
     storage = RedisStorage.from_url(REDIS_URL, connection_kwargs=redis_connection_kwargs())
     dp = Dispatcher(storage=storage)
 
+    dp.message.middleware(PinMiddleware())
+    dp.callback_query.middleware(PinMiddleware())
+
     dp.include_router(start.router)
+    dp.include_router(pin_auth.router)
     dp.include_router(report.router)
     dp.include_router(history.router)
     dp.include_router(categories.router)
@@ -134,7 +131,6 @@ async def main():
     dp.include_router(undo.router)
     dp.include_router(cars_command.router)
     dp.include_router(car_stats_command.router)
-    dp.include_router(resync.router)
     dp.include_router(input_handler.router)  # последний
 
     await run_health_server(bot, storage)  # для UptimeRobot + OAuth-callback на Render

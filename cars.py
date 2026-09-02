@@ -1,8 +1,12 @@
 """
 cars.py
-v1.3 - car registry + mileage logging, backed by Google Sheets (sheets_client.py)
+v1.4 - car registry + mileage logging, backed by Google Sheets (sheets_client.py)
 
 Changelog:
+- v1.4: get_last_auto_event() возвращает (событие, count) вместо просто
+        события — insights._answer_last_date теперь может сказать "и всего
+        так было N раз", а не только дату последнего. BREAKING: вызывающий
+        код должен распаковывать кортеж (обновлён insights.py).
 - v1.3: get_last_auto_event() теперь распознаёт синонимы жидкостей через
         fluid_tracker.detect_fluid_type — "когда менял антифриз" находит и
         запись, где в Описании написано "охлаждающая жидкость" (и вообще
@@ -40,7 +44,7 @@ async def add_car(account: dict, name: str, who: str = "",
     the first point in the mileage history (source: manual input) so
     average-km/month math has a real anchor from day one."""
     box = google_api.TokenBox(account)
-    async with sc.new_session() as session:
+    async with aiohttp.ClientSession() as session:
         async def _do_car(token):
             return await sc.append_row(
                 session, token, account["google_spreadsheet_id"], sc.SHEET_CARS,
@@ -61,7 +65,7 @@ async def add_car(account: dict, name: str, who: str = "",
 
 async def list_active_cars(account: dict) -> list[dict]:
     box = google_api.TokenBox(account)
-    async with sc.new_session() as session:
+    async with aiohttp.ClientSession() as session:
         async def _do(token):
             return await sc.get_rows(session, token, account["google_spreadsheet_id"], sc.SHEET_CARS)
         rows = await google_api.call(box, _do)
@@ -88,7 +92,7 @@ async def get_mileage_distance(account: dict, car_name: str,
     from datetime import timezone as _tz
 
     box = google_api.TokenBox(account)
-    async with sc.new_session() as session:
+    async with aiohttp.ClientSession() as session:
         async def _do(token):
             return await sc.get_rows(session, token, account["google_spreadsheet_id"], sc.SHEET_MILEAGE)
         rows = await google_api.call(box, _do)
@@ -140,12 +144,12 @@ def _keyword_matches(keyword: str, text: str) -> bool:
     return kw[:stem_len] in lowered
 
 
-async def get_last_auto_event(account: dict, car_name: str, keyword: str | None) -> dict | None:
-    """Самая свежая (по дате) запись листа Авто для car_name, чьё Описание
-    подходит под keyword. keyword None/пустой -> просто последняя запись по
-    машине, любого типа. Используется для вопросов "когда" ("когда менял
-    масло на опеле?") — insights.py вызывает это вместо car_period_stats,
-    т.к. вопрос не ограничен текущим отчётным периодом.
+async def get_last_auto_event(account: dict, car_name: str, keyword: str | None) -> tuple[dict | None, int]:
+    """(самая свежая подходящая запись, СКОЛЬКО ВСЕГО подходящих записей).
+    keyword None/пустой -> просто последняя запись по машине, любого типа.
+    Используется для вопросов "когда" ("когда менял масло на опеле?") —
+    insights.py вызывает это вместо car_period_stats, т.к. вопрос не
+    ограничен текущим отчётным периодом.
 
     Если keyword — это распознаваемый тип техжидкости (fluid_tracker),
     матчим ПО ТИПУ жидкости, а не по буквальному слову: "антифриз" из
@@ -155,7 +159,7 @@ async def get_last_auto_event(account: dict, car_name: str, keyword: str | None)
     (не жидкость — "бензин", "шиномонтаж" и т.п.) — обычное подстрочное
     совпадение с запасом на падежи."""
     box = google_api.TokenBox(account)
-    async with sc.new_session() as session:
+    async with aiohttp.ClientSession() as session:
         async def _do(token):
             return await sc.get_rows(session, token, account["google_spreadsheet_id"], sc.SHEET_AUTO)
         rows = await google_api.call(box, _do)
@@ -171,9 +175,9 @@ async def get_last_auto_event(account: dict, car_name: str, keyword: str | None)
         else:
             candidates = [r for r in candidates if _keyword_matches(keyword, str(r["Описание"]))]
     if not candidates:
-        return None
+        return None, 0
     candidates.sort(key=lambda r: str(r["Дата"]), reverse=True)
-    return candidates[0]
+    return candidates[0], len(candidates)
 
 
 async def get_latest_mileage(account: dict, car_name: str) -> float | None:
@@ -181,7 +185,7 @@ async def get_latest_mileage(account: dict, car_name: str) -> float | None:
     'Без изменений' button (re-log the same value with today's date) and,
     later, for average-km/month math."""
     box = google_api.TokenBox(account)
-    async with sc.new_session() as session:
+    async with aiohttp.ClientSession() as session:
         async def _do(token):
             return await sc.get_rows(session, token, account["google_spreadsheet_id"], sc.SHEET_MILEAGE)
         rows = await google_api.call(box, _do)
@@ -201,7 +205,7 @@ async def archive_and_export_car(account: dict, car_id: str) -> str | None:
     box = google_api.TokenBox(account)
     spreadsheet_id = account["google_spreadsheet_id"]
 
-    async with sc.new_session() as session:
+    async with aiohttp.ClientSession() as session:
         async def _get_cars(token):
             return await sc.get_rows(session, token, spreadsheet_id, sc.SHEET_CARS)
         cars_rows = await google_api.call(box, _get_cars)

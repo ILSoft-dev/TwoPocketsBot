@@ -1,9 +1,15 @@
 """
 report.py
-v1.1 - /report: сводка за отчётный период + кнопки для перехода к прошлым
-периодам (не только текущему).
+v1.2 - /report: сводка за отчётный период + кнопки для перехода к прошлым
+периодам (не только текущему) + "заметные изменения" по категориям.
 
 Changelog:
+- v1.2: подключил narrative_report.build_narrative_for_user — он уже был в
+        репозитории (narrative_report.py/period_utils.py), но НИЧТО его не
+        вызывало, отчёт молча не показывал заметные изменения по
+        категориям, хотя код для этого существовал. Теперь вызывается для
+        КАЖДОГО periods_back (не только текущего периода) — работает
+        одинаково для открытого текущего и закрытых прошлых.
 - v1.1: period_start() (используется и в insights.py — НЕ переименовывать,
         НЕ менять сигнатуру) осталась как была. Добавлены period_bounds()/
         period_label() — то же самое, но periods_back шагов назад, с явной
@@ -21,7 +27,6 @@ from aiogram.types import Message, CallbackQuery
 
 import supabase_client as db
 import sheets_transactions as tx
-import tx_logic
 import narrative_report
 from keyboards import report_periods_keyboard
 
@@ -82,7 +87,7 @@ def period_label(month_start_day: int, periods_back: int) -> str:
 
 
 def format_report_text(since: datetime, until: datetime | None, data: dict,
-                       currency: str, periods_back: int, on_hand: float | None) -> str:
+                       currency: str, periods_back: int) -> str:
     if periods_back == 0:
         header = f"📊 <b>Отчёт с {since.strftime('%d.%m')} (текущий период)</b>\n"
     else:
@@ -93,12 +98,8 @@ def format_report_text(since: datetime, until: datetime | None, data: dict,
         header,
         f"💰 Доход: {data['income']:g} {currency}",
         f"💸 Расход: {data['expense']:g} {currency}",
-        f"Остаток за период: {data['balance']:g} {currency}",
+        f"Остаток: {data['balance']:g} {currency}\n",
     ]
-    if on_hand is not None:
-        lines.append(f"На руках (с начала учёта): {on_hand:g} {currency}\n")
-    else:
-        lines.append("")
 
     if data["top5"]:
         lines.append("Топ категорий расходов:")
@@ -123,27 +124,27 @@ async def _fetch_report_text(user: dict, periods_back: int) -> tuple[str | None,
     since, until = period_bounds(month_start_day, periods_back)
     try:
         data = await tx.get_report_range(user["id"], since, until)
-        all_income, all_expense = await tx.get_all_time_totals(user["id"])
     except tx.NoGoogleAccount:
         return None, "Google Drive не подключён — пройди заново /start, чтобы подключить."
     except Exception:
         logging.exception("report: unexpected error fetching from Sheets")
         return None, "Не получилось обратиться к Google Диску. Если повторится — переподключи через /start."
 
-    on_hand = tx_logic.balance_on_hand(user.get("cash_on_hand"), all_income, all_expense)
     currency = user.get("currency", "RUB")
-    text = format_report_text(since, until, data, currency, periods_back, on_hand)
+    text = format_report_text(since, until, data, currency, periods_back)
 
-    try:
-        narrative = await narrative_report.build_narrative_for_user(
-            user["id"], since, until, label=period_label(month_start_day, periods_back),
-            currency=currency, period_type="custom_period",
-        )
-    except Exception:
-        logging.exception("report: narrative comparison failed, showing plain report without it")
-        narrative = ""
+    # "Заметные изменения по категориям" по сравнению с ПРЕДЫДУЩИМ таким же
+    # по длине периодом — период_type="current_period" тут корректен для
+    # ЛЮБОГО periods_back (не только текущего): previous_period_bounds для
+    # этого period_type берёт длину (until - since) и сдвигает её назад,
+    # что и есть "период сразу перед этим", независимо от того, закрыт он
+    # или ещё открыт. Никогда не роняет отчёт — при сбое просто пустая
+    # строка (см. build_narrative_for_user).
+    narrative = await narrative_report.build_narrative_for_user(
+        user["id"], since, until, "", currency, "current_period",
+    )
     if narrative:
-        text = text + "\n\n" + narrative
+        text += "\n\n" + narrative
 
     return text, None
 
