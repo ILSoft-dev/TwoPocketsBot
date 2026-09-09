@@ -1,4 +1,5 @@
 import os
+import auto_expense
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -54,11 +55,17 @@ SUPABASE_KEEPALIVE_INTERVAL_SECONDS = int(os.getenv("SUPABASE_KEEPALIVE_INTERVAL
 # окружения без передеплоя кода, если гайд будет переопубликован по новому URL.
 GUIDE_URL = os.getenv("GUIDE_URL", "https://telegra.ph/Instrukciya-k-Two-Pockets-bot-08-11")
 
-# Дефолтные категории, создаются каждому юзеру при онбординге
+# Дефолтные категории, создаются каждому юзеру при онбординге. Раньше была
+# одна "Авто" на всё — теперь классификатор (auto_expense.classify_auto_type)
+# сам решает, в какую из четырёх писать конкретную траты, см. forced_category
+# ниже и changelog auto_expense.py.
 DEFAULT_CATEGORIES = [
     "Продукты",
     "Транспорт",
-    "Авто",
+    "Топливо",
+    "Ремонт/ТО",
+    "Запчасти",
+    "Прочее",
     "Досуг",
     "Коммуналка",
     "Зарплата",
@@ -111,9 +118,16 @@ def keyword_hits(text: str, keywords: list) -> bool:
 def forced_category(text: str) -> str | None:
     """None значит "не уверены, спроси LLM/юзера как обычно" — вызывающий
     код (input_handler.resolve_expense_category) просто продолжает свой
-    обычный путь категоризации, если тут пусто."""
+    обычный путь категоризации, если тут пусто.
+
+    Для авто-ключевых слов возвращаем НЕ фиксированную строку, а результат
+    auto_expense.classify_auto_type(text) — единый источник правды для
+    того, какая из четырёх авто-категорий (Топливо/Ремонт-ТО/Запчасти/
+    Прочее) это на самом деле. AUTO_FORCE_KEYWORDS ниже — просто более
+    ранний, дешёвый способ понять "это точно про машину", сама категория
+    внутри всё равно решается классификатором, а не этим списком."""
     if keyword_hits(text, AUTO_FORCE_KEYWORDS):
-        return "Авто"
+        return auto_expense.classify_auto_type(text)
     if keyword_hits(text, TRANSPORT_FORCE_KEYWORDS):
         return "Транспорт"
     return None

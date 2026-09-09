@@ -329,6 +329,22 @@ def mirror_update_date(sheet_row_id: str, new_date_time: str) -> None:
         logger.warning("tx_mirror update date skipped", exc_info=True)
 
 
+def mirror_update_amount(sheet_row_id: str, new_amount: float) -> None:
+    """См. mirror_update_date выше — тот же точечный UPDATE, для /edit."""
+    try:
+        db.table("tx_mirror").update({"amount": new_amount}).eq("sheet_row_id", sheet_row_id).execute()
+    except Exception:
+        logger.warning("tx_mirror update amount skipped", exc_info=True)
+
+
+def mirror_update_category(sheet_row_id: str, new_category: str) -> None:
+    """См. mirror_update_date выше — тот же точечный UPDATE, для /edit."""
+    try:
+        db.table("tx_mirror").update({"category": new_category}).eq("sheet_row_id", sheet_row_id).execute()
+    except Exception:
+        logger.warning("tx_mirror update category skipped", exc_info=True)
+
+
 def mirror_rename_category(owner_user_id: int | None, old_name: str, new_name: str) -> None:
     try:
         q = db.table("tx_mirror").update({"category": new_name}).eq("category", old_name)

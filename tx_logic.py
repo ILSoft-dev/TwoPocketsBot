@@ -410,3 +410,18 @@ def compute_period_notes(rows: list[dict], income_total: float, currency: str,
     return notes
 
 
+def parse_user_amount(text: str) -> float | None:
+    """Простой парсер голой суммы (без валюты — валюта не хранится
+    потранзакционно, это настройка юзера, не поле записи) для /edit.
+    None на мусоре, нуле, отрицательном числе — вызывающий код просит
+    ввести заново, не молча подставляет что попало."""
+    cleaned = text.strip().replace(",", ".").replace(" ", "")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+

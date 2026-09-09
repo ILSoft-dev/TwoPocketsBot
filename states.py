@@ -60,6 +60,9 @@ class BackdateStates(StatesGroup):
 
 
 class EditStates(StatesGroup):
-    """/edit — после выбора конкретной транзакции кнопкой, ждём новую дату
-    текстом."""
+    """/edit — после выбора конкретной транзакции кнопкой, ждём выбор поля
+    (дата/сумма/категория), потом соответствующее новое значение текстом
+    (для категории — либо кнопка существующей, либо текст для новой)."""
     waiting_new_date = State()
+    waiting_new_amount = State()
+    waiting_new_category_name = State()

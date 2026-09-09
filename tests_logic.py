@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import forced_category, looks_like_question
+import auto_expense
 from tx_logic import (
     apply_soft_delete_last,
     balance_on_hand,
@@ -16,6 +17,7 @@ from tx_logic import (
     STATUS_ACTIVE,
     STATUS_DELETED,
     parse_user_date,
+    parse_user_amount,
     filter_by_who,
     sort_by_date_desc,
     compute_period_notes,
@@ -27,11 +29,34 @@ from tx_logic import (
 
 
 def test_forced_category():
-    assert forced_category("бензин 40р") == "Авто"
-    assert forced_category("ремонт авто 200р") == "Авто"
+    assert forced_category("бензин 40р") == "Топливо"
+    assert forced_category("ремонт авто 200р") == "Ремонт/ТО"
     assert forced_category("ремонт квартиры 200р") is None
     assert forced_category("такси до вокзала") == "Транспорт"
     assert forced_category("кофе") is None
+
+
+def test_classify_auto_type():
+    c = auto_expense.classify_auto_type
+    assert c("Бензин Опель") == "Топливо"
+    assert c("Заправка дизель") == "Топливо"
+    # действие важнее детали — "замена рычагов" это Ремонт/ТО, не Запчасти
+    assert c("Замена рычагов daewoo matiz") == "Ремонт/ТО"
+    assert c("Ремонт подвески") == "Ремонт/ТО"
+    assert c("Техосмотр") == "Ремонт/ТО"
+    assert c("Шиномонтаж") == "Ремонт/ТО"
+    # деталь/жидкость без слова-действия — Запчасти
+    assert c("Передний рычаг матиз") == "Запчасти"
+    assert c("Наконечники рулевой тяги") == "Запчасти"
+    assert c("Антифриз") == "Запчасти"
+    assert c("Тормозные колодки") == "Запчасти"
+    # фоллбэк без явных ключевых слов
+    assert c("Вонючка в машину") == "Прочее"
+    assert c("Чехлы в салон") == "Прочее"
+    assert c("Омывайка") == "Прочее"
+    # регрессия: "шин" — подстрока "маШИНа/маШИНу", раньше ложно триггерило Ремонт
+    assert c("Купил новую машину") == "Прочее"
+    assert c("Шторка в машину") == "Прочее"
 
 
 def test_looks_like_question():
@@ -116,6 +141,17 @@ def test_parse_user_date():
     assert parse_user_date("01.01.20", today=today) is None
 
 
+def test_parse_user_amount():
+    assert parse_user_amount("150") == 150.0
+    assert parse_user_amount("34.99") == 34.99
+    assert parse_user_amount("34,99") == 34.99  # запятая как разделитель
+    assert parse_user_amount("1 500") == 1500.0  # пробел-разделитель тысяч
+    assert parse_user_amount("0") is None
+    assert parse_user_amount("-50") is None
+    assert parse_user_amount("не число") is None
+    assert parse_user_amount("") is None
+
+
 def test_filter_by_who_and_sort():
     rows = [
         {"ID": "a", "Кто": "ilya", "Дата и время": "2026-08-01T10:00:00+00:00"},
@@ -187,12 +223,14 @@ def test_ru_plural_boundaries():
 
 if __name__ == "__main__":
     test_forced_category()
+    test_classify_auto_type()
     test_looks_like_question()
     test_rename_category()
     test_soft_undo()
     test_cash_on_hand()
     test_duplicate_window()
     test_parse_user_date()
+    test_parse_user_amount()
     test_filter_by_who_and_sort()
     test_period_notes_category_shape()
     test_period_notes_hidden_visits_vs_batch_session()

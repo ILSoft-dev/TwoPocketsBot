@@ -45,7 +45,15 @@ from states import AmbiguousCategoryStates, CarResolutionStates
 router = Router()
 
 INCOME_CATEGORIES = ["Зарплата", "Подработка", "Доход"]
-AUTO_CATEGORY = "Авто"
+# Раньше была одна категория "Авто" — теперь классификатор
+# (auto_expense.classify_auto_type) сам решает финальную категорию из
+# четырёх, и ЛЮБАЯ из них должна вести в структурированный авто-поток
+# (car/type/mileage). Берём константы прямо из auto_expense.py, а не
+# дублируем строки здесь — одно место правды на тип.
+AUTO_CATEGORIES = {
+    auto_expense.TYPE_FUEL, auto_expense.TYPE_REPAIR,
+    auto_expense.TYPE_PARTS, auto_expense.TYPE_OTHER,
+}
 
 
 def who_label(user: User) -> str:
@@ -131,6 +139,20 @@ async def finalize_auto_expense(message: Message, user_id: int, who: str, amount
                                 tx_type: str, car_name: str, auto_type: str,
                                 description: str, mileage: float | None, source: str,
                                 quantity: float | None = None, unit: str | None = None):
+    # Автосоздание категории, если её ещё нет в таблице — тот же паттерн,
+    # что уже есть в new_category_named для вручную введённого имени.
+    # Закрывает практический разрыв при деплое: у уже существующих
+    # пользователей в категориях всё ещё старая одна "Авто", а не новые
+    # четыре — без этого auto_type писался бы в лист корректно, но не
+    # появлялся бы как управляемая категория в /categories, пока юзер не
+    # добавит её вручную.
+    try:
+        existing_names = [c["name"] for c in await asyncio.to_thread(db.get_categories, user_id)]
+        if auto_type not in existing_names:
+            await asyncio.to_thread(db.add_category, user_id, auto_type)
+    except Exception:
+        logging.exception("finalize_auto_expense: failed to auto-create category %s", auto_type)
+
     backdate_dt = await backdate.get_active_date(user_id)
     try:
         await tx.save_auto_expense(user_id, who, amount, tx_type, car_name, auto_type,
@@ -165,7 +187,14 @@ async def ask_car_disambiguation(message: Message, state: FSMContext, active_car
 
 async def route_auto_expense(message: Message, state: FSMContext, user_id: int, who: str,
                              amount: float, tx_type: str, source: str, remainder: str,
-                             quantity: float | None = None, unit: str | None = None):
+                             quantity: float | None = None, unit: str | None = None,
+                             preferred_type: str | None = None):
+    """preferred_type — если человек ЯВНО выбрал одну из авто-категорий сам
+    (кнопкой в диалоге уточнения, а не через forced_category/category_map/
+    угадывание Groq), его выбор побеждает классификатор по тексту. Иначе
+    редкое, но реальное несоответствие: нажал "Запчасти", а
+    classify_auto_type по тексту решил "Ремонт/ТО" — и записалось не то,
+    что человек только что подтвердил."""
     account = db.get_effective_google_account(user_id)
     try:
         active_cars = await cars.list_active_cars(account) if account else []
@@ -179,7 +208,7 @@ async def route_auto_expense(message: Message, state: FSMContext, user_id: int, 
 
     matched_name = cars.match_car_name(remainder, active_cars)
     mileage = auto_expense.extract_mileage(remainder)
-    auto_type = auto_expense.classify_auto_type(remainder)
+    auto_type = preferred_type or auto_expense.classify_auto_type(remainder)
 
     if matched_name:
         await finalize_auto_expense(message, user_id, who, amount, tx_type, matched_name,
@@ -405,7 +434,8 @@ async def ask_category_choice(
         categories = INCOME_CATEGORIES + [c for c in categories if c not in INCOME_CATEGORIES]
 
     # Храним ПОЛНЫЙ remainder, а не только первое слово — если в итоге
-    # выберут "Авто", нужен весь текст для разбора машины/типа/пробега.
+    # выберут одну из авто-категорий (Топливо/Ремонт-ТО/Запчасти/Прочее),
+    # нужен весь текст для разбора машины/типа/пробега.
     # item_text отдельно — "очищенный" от количества/единицы вариант
     # remainder (см. parser.extract_quantity), нужен для обучения
     # category_map по первому слову ("5 литров масла..." иначе выучило бы
@@ -440,10 +470,10 @@ async def new_category_named(message: Message, state: FSMContext):
     quantity, unit = data.get("quantity"), data.get("unit")
     item_text = data.get("item_text", remainder)
 
-    existing_names = [c["name"] for c in db.get_categories(user["id"])]
+    existing_names = [c["name"] for c in await asyncio.to_thread(db.get_categories, user["id"])]
     if name not in existing_names:
         try:
-            db.add_category(user["id"], name)
+            await asyncio.to_thread(db.add_category, user["id"], name)
         except Exception:
             logging.exception("new_category_named: unexpected error adding category")
             await message.answer(
@@ -452,10 +482,11 @@ async def new_category_named(message: Message, state: FSMContext):
             )
             return
 
-    if name == AUTO_CATEGORY:
+    if name in AUTO_CATEGORIES:
         await route_auto_expense(
             message, state, user["id"], who,
             data["amount"], data["tx_type"], data["source"], remainder, quantity, unit,
+            preferred_type=name,
         )
         return
 
@@ -478,10 +509,11 @@ async def category_chosen(callback: CallbackQuery, state: FSMContext):
     quantity, unit = data.get("quantity"), data.get("unit")
     item_text = data.get("item_text", remainder)
 
-    if category == AUTO_CATEGORY:
+    if category in AUTO_CATEGORIES:
         await route_auto_expense(
             callback.message, state, user["id"], who,
             data["amount"], data["tx_type"], data["source"], remainder, quantity, unit,
+            preferred_type=category,
         )
         # route_auto_expense сам решает, чистить ли state (может понадобиться
         # дизамбигуация машины — тогда state переходит в CarResolutionStates)
@@ -547,7 +579,7 @@ async def process_text_input(message: Message, state: FSMContext, text: str, sou
                                   quantity, unit, item_text)
         return
 
-    if category == AUTO_CATEGORY:
+    if category in AUTO_CATEGORIES:
         await route_auto_expense(message, state, user["id"], who, amount, tx_type, source, remainder,
                                  quantity, unit)
         return

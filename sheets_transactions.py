@@ -227,13 +227,17 @@ async def save_auto_expense(user_id: int, who: str, amount: float, tx_type: str,
     box = google_api.TokenBox(account)
     sid = account["google_spreadsheet_id"]
     now = effective_now.isoformat()
+    # Категория в "Транзакции" — сам auto_type (Топливо/Ремонт-ТО/Запчасти/
+    # Прочее), не фиксированная "Авто" — раньше все авто-траты писались в
+    # одну общую категорию независимо от типа; теперь классификатор решает
+    # финальную категорию сразу, а не только метку в служебном листе "Авто".
     async with sc.new_session() as session:
         async def _do_tx(token):
             if await sc.row_id_exists(session, token, sid, sc.SHEET_TRANSACTIONS, tx_id):
                 return tx_id
             return await sc.append_row(
                 session, token, sid, sc.SHEET_TRANSACTIONS,
-                [now, who, tx_type, "Авто", amount, source, description, STATUS_ACTIVE,
+                [now, who, tx_type, auto_type, amount, source, description, STATUS_ACTIVE,
                  quantity if quantity is not None else "", unit or ""],
                 row_id=tx_id,
             )
@@ -261,9 +265,9 @@ async def save_auto_expense(user_id: int, who: str, amount: float, tx_type: str,
                 )
             await google_api.call(box, _do_mileage)
 
-    db.mirror_upsert_row(account["id"], {
+    await asyncio.to_thread(db.mirror_upsert_row, account["id"], {
         "ID": tx_id, "Дата и время": now, "Кто": who, "Тип": tx_type,
-        "Категория": "Авто", "Сумма": amount, "Источник": source,
+        "Категория": auto_type, "Сумма": amount, "Источник": source,
         "Комментарий": description, "Статус": STATUS_ACTIVE,
         "Количество": quantity if quantity is not None else "", "Единица": unit or "",
     })
@@ -294,16 +298,27 @@ async def get_own_transactions(user_id: int, who: str) -> list[dict]:
     return tx_logic.sort_by_date_desc(own)
 
 
+async def _get_own_active_row(user_id: int, who: str, row_id: str) -> tuple[dict, dict] | None:
+    """Общая проверка для всех update_transaction_* ниже: находит строку,
+    убеждается, что она СВОЯ и ещё активна. None, если нет — вызывающая
+    функция просто возвращает False, ничего не трогая."""
+    account = _get_account(user_id)
+    rows = await _all_tx_rows_for_account(account)
+    row = next((r for r in rows if r.get("ID") == row_id), None)
+    if not row or row.get("Кто") != who or row.get("Статус") != STATUS_ACTIVE:
+        return None
+    return account, row
+
+
 async def update_transaction_date(user_id: int, who: str, row_id: str, new_date) -> bool:
     """Меняет дату (сохраняя исходное время суток — время не спрашиваем,
     только дату) у СВОЕЙ активной транзакции. False, если строка не
     найдена, чужая или уже удалена (в любом из этих случаев ничего не
     трогаем — вызывающий код сам решает, что сказать пользователю)."""
-    account = _get_account(user_id)
-    rows = await _all_tx_rows_for_account(account)
-    row = next((r for r in rows if r.get("ID") == row_id), None)
-    if not row or row.get("Кто") != who or row.get("Статус") != STATUS_ACTIVE:
+    found_row = await _get_own_active_row(user_id, who, row_id)
+    if not found_row:
         return False
+    account, row = found_row
 
     old_dt = tx_logic.parse_dt(row.get("Дата и время"))
     old_time = old_dt.timetz() if old_dt else datetime.now(timezone.utc).timetz()
@@ -322,6 +337,57 @@ async def update_transaction_date(user_id: int, who: str, row_id: str, new_date)
         return False
 
     await asyncio.to_thread(db.mirror_update_date, row_id, new_value)
+    return True
+
+
+async def update_transaction_amount(user_id: int, who: str, row_id: str, new_amount: float) -> bool:
+    """Меняет сумму у СВОЕЙ активной транзакции. Не трогает "Авто" —
+    для авто-трат сумма там записана отдельной строкой без общего ID
+    (save_auto_expense пишет в оба листа независимыми row_id), править
+    обе синхронно отсюда нечем связать надёжно — так что /edit правит
+    только основной лист "Транзакции", лист "Авто" остаётся как был."""
+    found_row = await _get_own_active_row(user_id, who, row_id)
+    if not found_row:
+        return False
+    account, _row = found_row
+
+    box = google_api.TokenBox(account)
+    async with sc.new_session() as session:
+        async def _do(token):
+            return await sc.update_cell(
+                session, token, account["google_spreadsheet_id"],
+                sc.SHEET_TRANSACTIONS, row_id, "Сумма", new_amount,
+            )
+        found = await google_api.call(box, _do)
+    if not found:
+        return False
+
+    await asyncio.to_thread(db.mirror_update_amount, row_id, new_amount)
+    return True
+
+
+async def update_transaction_category(user_id: int, who: str, row_id: str, new_category: str) -> bool:
+    """Меняет категорию у СВОЕЙ активной транзакции — просто переименование
+    ОДНОЙ строки, в отличие от rename_category_in_sheet (которая
+    переименовывает категорию ВЕЗДЕ). Тот же нюанс про "Авто", что и в
+    update_transaction_amount — лист "Авто" не трогается."""
+    found_row = await _get_own_active_row(user_id, who, row_id)
+    if not found_row:
+        return False
+    account, _row = found_row
+
+    box = google_api.TokenBox(account)
+    async with sc.new_session() as session:
+        async def _do(token):
+            return await sc.update_cell(
+                session, token, account["google_spreadsheet_id"],
+                sc.SHEET_TRANSACTIONS, row_id, "Категория", new_category,
+            )
+        found = await google_api.call(box, _do)
+    if not found:
+        return False
+
+    await asyncio.to_thread(db.mirror_update_category, row_id, new_category)
     return True
 
 
