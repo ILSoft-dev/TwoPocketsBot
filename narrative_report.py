@@ -1,9 +1,12 @@
 """
 narrative_report.py
-v1.1 - связный текстовый отчёт со сравнением периода с самим собой ("эта
+v1.2 - связный текстовый отчёт со сравнением периода с самим собой ("эта
 категория выросла на 30%"), а не generic-советами про экономию. Общий
 код для /report (текущий период vs предыдущий) и годового отчёта 1 января
-(прошлый год vs год до него).
+(прошлый год vs год до него). Плюс структурные ЗАМЕТКИ за один закрытый
+период (форма категории, скрытые визиты, регулярность, крупные покупки/
+доход, сессии пакетного ввода) — отправляются автоматически на закрытии
+периода, не по требованию /report (см. changelog v1.2 ниже почему).
 
 Порог "заметного" изменения и минимальная сумма для упоминания — чтобы не
 шуметь про случайные мелкие траты, где любое небольшое отклонение даёт
@@ -11,6 +14,18 @@ v1.1 - связный текстовый отчёт со сравнением п
 но абсолютно незначимо).
 
 Changelog:
+- v1.2: build_period_notes_for_account/run_period_notes_sweep —
+        структурные заметки (tx_logic.compute_period_notes) за ЗАКРЫТЫЙ
+        период, автоматически на его закрытии (тот же триггер, что уже
+        использует car_stats.py для месячной авто-статистики,
+        period_utils.is_period_end_today). Специально НЕ по требованию
+        /report: часть заметок (например, "крупные покупки = X% дохода")
+        вводит в заблуждение на неполных данных середины периода — доход
+        может ещё не поступить, картина выправится к концу. LLM-обёртка
+        через groq_client.narrate_period_notes — ОТДЕЛЬНАЯ функция от
+        narrate_period_comparison ниже, с явным запретом советовать и
+        предполагать причины трат (заметки о форме данных, не оценка
+        решений пользователя).
 - v1.1: числа по-прежнему считает только Python (_totals_by_category,
         _format_comparison — детерминированно, без LLM). Сверху добавлена
         необязательная обёртка в связный текст через
@@ -31,6 +46,7 @@ import redis.asyncio as redis_asyncio
 
 import supabase_client as db
 import groq_client
+import tx_logic
 from config import REDIS_URL
 from sheets_transactions import (
     get_transactions_in_range,
@@ -38,7 +54,7 @@ from sheets_transactions import (
     to_float,
     NoGoogleAccount,
 )
-from period_utils import previous_period_bounds
+from period_utils import previous_period_bounds, period_start, is_period_end_today
 
 logger = logging.getLogger(__name__)
 
@@ -239,3 +255,100 @@ async def run_annual_report_sweep(bot) -> int:
             pass
 
     return sent
+
+
+# ------------------------------------------------ структурные заметки за период --
+_PERIOD_NOTES_GUARD_TTL_SECONDS = 40 * 24 * 60 * 60  # с запасом до следующего закрытия периода
+
+
+async def build_period_notes_for_account(account: dict, since: datetime, until: datetime,
+                                         currency: str, period_days: int,
+                                         heading: str = "\U0001F4A1 На что стоит обратить внимание:") -> str:
+    """Заметки о ФОРМЕ трат за один закрытый период (см. tx_logic.
+    compute_period_notes) — не советы, наблюдения. Та же схема
+    отказоустойчивости, что и у build_narrative_for_user выше: Python
+    считает и порогует, LLM (groq_client.narrate_period_notes) только
+    оборачивает в текст; при сбое Groq — тихий откат на список буллетов."""
+    try:
+        rows = await get_transactions_in_range_for_account(account, since, until)
+    except Exception:
+        logger.exception("build_period_notes_for_account: failed to fetch rows")
+        return ""
+    if not rows:
+        return ""
+
+    income_total = sum(to_float(r.get("Сумма")) for r in rows if r.get("Тип") == "income")
+    notes = tx_logic.compute_period_notes(rows, income_total, currency, period_days)
+    if not notes:
+        return ""
+
+    fallback_text = heading + "\n" + "\n".join(f"• {n}" for n in notes)
+
+    data_summary = (
+        f"Период: {period_days} дней\n"
+        f"Структурные наблюдения (не советы — только форма трат):\n"
+        + "\n".join(f"- {n}" for n in notes)
+    )
+    try:
+        return await asyncio.to_thread(groq_client.narrate_period_notes, data_summary)
+    except Exception:
+        logger.warning("build_period_notes_for_account: LLM narration failed, using bullet list", exc_info=True)
+        return fallback_text
+
+
+async def _already_sent_period_notes(user_id: int, period_label: str) -> bool:
+    return bool(await _redis.get(f"period_notes_sent:{user_id}:{period_label}"))
+
+
+async def _mark_sent_period_notes(user_id: int, period_label: str) -> None:
+    await _redis.set(
+        f"period_notes_sent:{user_id}:{period_label}", "1", ex=_PERIOD_NOTES_GUARD_TTL_SECONDS,
+    )
+
+
+async def run_period_notes_sweep(bot) -> int:
+    """Раз в отчётный период — на закрытии (тот же триггер, что уже
+    использует car_stats.run_monthly_stats_sweep, period_utils.
+    is_period_end_today), НЕ по требованию /report. Причина: часть заметок
+    (например, доля крупных покупок от дохода) вводит в заблуждение на
+    неполных данных середины периода — доход может ещё не поступить,
+    к концу периода картина обычно выправляется сама."""
+    sent = 0
+    for account in db.list_google_connected_users():
+        owner = db.get_user_by_id(account["id"])
+        if not owner:
+            continue
+        month_start_day = owner.get("month_start", 1)
+        if not is_period_end_today(month_start_day):
+            continue
+
+        since = period_start(month_start_day)
+        until = datetime.now(timezone.utc)
+        period_days = max((until - since).days, 1)
+        period_label = since.strftime("%Y-%m-%d")  # уникально на период, не на календарный день
+
+        try:
+            if await _already_sent_period_notes(account["id"], period_label):
+                continue
+        except Exception:
+            pass
+
+        currency = owner.get("currency", "RUB")
+        text = await build_period_notes_for_account(account, since, until, currency, period_days)
+
+        if text:
+            recipients = db.get_spreadsheet_recipients(account["id"])
+            for tg_id in recipients:
+                try:
+                    await bot.send_message(tg_id, text)
+                    sent += 1
+                except Exception:
+                    pass
+
+        try:
+            await _mark_sent_period_notes(account["id"], period_label)
+        except Exception:
+            pass
+
+    return sent
+

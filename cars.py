@@ -1,8 +1,12 @@
 """
 cars.py
-v1.3 - car registry + mileage logging, backed by Google Sheets (sheets_client.py)
+v1.4 - car registry + mileage logging, backed by Google Sheets (sheets_client.py)
 
 Changelog:
+- v1.4: get_last_auto_event() теперь возвращает (событие, число_подходящих)
+        вместо просто события — insights.py показывает "(всего N раз)" в
+        ответе на "когда менял...", если подходящих записей больше одной,
+        не только самую свежую дату молча.
 - v1.3: get_last_auto_event() теперь распознаёт синонимы жидкостей через
         fluid_tracker.detect_fluid_type — "когда менял антифриз" находит и
         запись, где в Описании написано "охлаждающая жидкость" (и вообще
@@ -140,12 +144,12 @@ def _keyword_matches(keyword: str, text: str) -> bool:
     return kw[:stem_len] in lowered
 
 
-async def get_last_auto_event(account: dict, car_name: str, keyword: str | None) -> dict | None:
-    """Самая свежая (по дате) запись листа Авто для car_name, чьё Описание
-    подходит под keyword. keyword None/пустой -> просто последняя запись по
-    машине, любого типа. Используется для вопросов "когда" ("когда менял
-    масло на опеле?") — insights.py вызывает это вместо car_period_stats,
-    т.к. вопрос не ограничен текущим отчётным периодом.
+async def get_last_auto_event(account: dict, car_name: str, keyword: str | None) -> tuple[dict | None, int]:
+    """(самая свежая подходящая запись, СКОЛЬКО ВСЕГО подходящих записей).
+    keyword None/пустой -> просто последняя запись по машине, любого типа.
+    Используется для вопросов "когда" ("когда менял масло на опеле?") —
+    insights.py вызывает это вместо car_period_stats, т.к. вопрос не
+    ограничен текущим отчётным периодом.
 
     Если keyword — это распознаваемый тип техжидкости (fluid_tracker),
     матчим ПО ТИПУ жидкости, а не по буквальному слову: "антифриз" из
@@ -171,9 +175,9 @@ async def get_last_auto_event(account: dict, car_name: str, keyword: str | None)
         else:
             candidates = [r for r in candidates if _keyword_matches(keyword, str(r["Описание"]))]
     if not candidates:
-        return None
+        return None, 0
     candidates.sort(key=lambda r: str(r["Дата"]), reverse=True)
-    return candidates[0]
+    return candidates[0], len(candidates)
 
 
 async def get_latest_mileage(account: dict, car_name: str) -> float | None:

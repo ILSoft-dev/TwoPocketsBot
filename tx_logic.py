@@ -176,3 +176,237 @@ def mirror_to_sheet_row(m: dict) -> dict:
         "Количество": m.get("quantity") if m.get("quantity") is not None else "",
         "Единица": m.get("unit") or "",
     }
+
+
+def filter_by_who(rows: list[dict], who: str) -> list[dict]:
+    return [r for r in rows if r.get("Кто") == who]
+
+
+def sort_by_date_desc(rows: list[dict], date_key: str = "Дата и время") -> list[dict]:
+    return sorted(rows, key=lambda r: str(r.get(date_key) or ""), reverse=True)
+
+
+def parse_user_date(text: str, today=None, max_days_back: int = 730):
+    """Общий парсер дат из пользовательского ввода — ДД.ММ или ДД.ММ.ГГ(ГГ).
+    Используется и /backdate, и /edit (см. backdate.py, edit.py), чтобы не
+    держать два чуть разных парсера дат в одном проекте. Отклоняет даты в
+    будущем и дальше max_days_back дней в прошлом (почти наверняка
+    опечатка, а не осознанный ввод).
+
+    ВАЖНО про формат ДД.ММ без года: год берётся текущий, БЕЗ автоматического
+    переноса на прошлый год, даже если результат попал в будущее (например,
+    "15.09" в сентябре при today=09.09 — это будущая дата, отклоняем, а не
+    молча трактуем как "15 сентября прошлого года"). Для дат вблизи границы
+    года ("хочу занести декабрьскую покупку в январе") просто укажи год
+    явно: "28.12.25" вместо "28.12" — это чуть менее удобно, зато никогда
+    не подставит не тот год без ведома пользователя."""
+    today = today or datetime.now(timezone.utc).date()
+    text = text.strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%d.%m"):
+        try:
+            parsed = datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+        if fmt == "%d.%m":
+            parsed = parsed.replace(year=today.year)
+        if parsed > today or (today - parsed).days > max_days_back:
+            return None
+        return parsed
+    return None
+
+
+# ------------------------------------------------- structural period notes ---
+# "Заметки", а не советы — про ФОРМУ трат, никогда не про их содержание
+# (см. обсуждение в чате: "трать меньше на мороженое" — оценочно и рискует
+# промахнуться мимо контекста; "8 крупных покупок = 49% бюджета" — просто
+# факт про структуру). Каждая функция ниже возвращает пусто, если порог
+# значимости не пройден — молчание по умолчанию, не шум ради шума.
+
+def _ru_plural(n: int, one: str, few: str, many: str) -> str:
+    """Простое склонение количественных существительных для заметок ниже
+    (1 покупка / 2 покупки / 5 покупок, с исключением 11-14 → many)."""
+    n_abs = abs(n) % 100
+    if 11 <= n_abs <= 14:
+        return many
+    n1 = n_abs % 10
+    if n1 == 1:
+        return one
+    if 2 <= n1 <= 4:
+        return few
+    return many
+
+
+def note_category_shape(rows: list[dict], currency: str,
+                        min_category_total: float = 50,
+                        concentrated_threshold: float = 0.5,
+                        spread_threshold: float = 0.15) -> list[str]:
+    """Топ-3 категории по сумме: одна крупная покупка тащит всю категорию
+    (концентрированная — предсказуемый разовый расход) или много мелких
+    без явного лидера (размазанная — фоновый регулярный расход). Одно и
+    то же место в топе может означать совершенно разное поведение."""
+    by_cat: dict[str, list[float]] = {}
+    for r in rows:
+        if r.get("Тип") != "expense":
+            continue
+        cat = r.get("Категория") or "Разное"
+        by_cat.setdefault(cat, []).append(to_float(r.get("Сумма")))
+
+    totals = {cat: sum(amts) for cat, amts in by_cat.items()}
+    top = sorted(totals.items(), key=lambda x: -x[1])[:3]
+
+    notes = []
+    for cat, total in top:
+        amts = by_cat[cat]
+        if total < min_category_total or len(amts) < 2:
+            continue
+        biggest = max(amts)
+        pct = biggest / total
+        if pct >= concentrated_threshold:
+            notes.append(
+                f"«{cat}» — почти целиком одна покупка ({biggest:g}{currency}, "
+                f"{pct * 100:.0f}% суммы категории), не растущий фон расходов"
+            )
+        elif pct <= spread_threshold and len(amts) >= 5:
+            notes.append(
+                f"«{cat}» — {len(amts)} мелких покупок без явного лидера "
+                f"(самая крупная — только {pct * 100:.0f}% суммы категории)"
+            )
+    return notes
+
+
+def _cluster_by_time(rows: list[dict], window_seconds: int) -> list[list[dict]]:
+    """Общая часть note_hidden_visits/note_batch_logging_sessions — группирует
+    строки, идущие подряд с разницей не больше window_seconds, в кластеры."""
+    sorted_rows = sorted(rows, key=lambda r: str(r.get("Дата и время") or ""))
+    clusters: list[list[dict]] = []
+    cluster: list[dict] = []
+    for r in sorted_rows:
+        if not cluster:
+            cluster = [r]
+            continue
+        prev_t = parse_dt(cluster[-1].get("Дата и время"))
+        cur_t = parse_dt(r.get("Дата и время"))
+        if prev_t and cur_t and 0 <= (cur_t - prev_t).total_seconds() <= window_seconds:
+            cluster.append(r)
+        else:
+            clusters.append(cluster)
+            cluster = [r]
+    if cluster:
+        clusters.append(cluster)
+    return clusters
+
+
+def note_hidden_visits(rows: list[dict], currency: str,
+                       window_seconds: int = 600, min_items: int = 3,
+                       min_total: float = 10) -> list[str]:
+    """Несколько покупок ОДНОЙ категории, вбитых почти подряд — вероятно
+    один визит/поход, распределённый по отдельным строкам. По одной каждая
+    незаметна, вместе — заметная сумма, которая иначе спрятана в списке."""
+    expense_rows = [r for r in rows if r.get("Тип") == "expense"]
+    notes = []
+    for cluster in _cluster_by_time(expense_rows, window_seconds):
+        if len(cluster) < min_items:
+            continue
+        cats = {r.get("Категория") for r in cluster}
+        if len(cats) != 1:
+            continue  # смешанные категории — это сессия пакетного ввода, см. ниже
+        total = sum(to_float(r.get("Сумма")) for r in cluster)
+        if total < min_total:
+            continue
+        cat = cats.pop()
+        dt = parse_dt(cluster[0].get("Дата и время"))
+        date_str = dt.strftime("%d.%m") if dt else "?"
+        purchase_word = _ru_plural(len(cluster), "покупка", "покупки", "покупок")
+        notes.append(
+            f"{date_str}: {len(cluster)} {purchase_word} «{cat}» одним визитом — "
+            f"вместе {total:g}{currency}, по отдельности не видно"
+        )
+    return notes
+
+
+def note_frequency(rows: list[dict], period_days: int,
+                   min_occurrences: int = 4, max_avg_gap_days: float = 10) -> list[str]:
+    """Регулярность категории — не сумма, а КАК ЧАСТО. Там, где сумма
+    маленькая и незаметная, сама регулярность иногда узнаваемее — не
+    "сколько ушло", а "как часто это вообще происходит"."""
+    if period_days <= 0:
+        return []
+    by_cat: dict[str, int] = {}
+    for r in rows:
+        if r.get("Тип") != "expense":
+            continue
+        cat = r.get("Категория") or "Разное"
+        by_cat[cat] = by_cat.get(cat, 0) + 1
+
+    notes = []
+    for cat, count in by_cat.items():
+        if count < min_occurrences:
+            continue
+        avg_gap = period_days / count
+        if avg_gap <= max_avg_gap_days:
+            notes.append(f"«{cat}» — регулярно, примерно раз в {avg_gap:.1f} дня ({count} раз за период)")
+    return notes
+
+
+def note_big_purchases_share_of_income(rows: list[dict], income_total: float, currency: str,
+                                       big_threshold: float = 100,
+                                       share_threshold: float = 0.4) -> str | None:
+    """Крупные покупки относительно ДОХОДА периода, не расхода — часто
+    нагляднее, потому что напрямую отвечает "на что хватило бы заработанного
+    в этом же периоде", а не абстрактный процент от общей суммы трат."""
+    if income_total <= 0:
+        return None
+    big = [r for r in rows if r.get("Тип") == "expense" and to_float(r.get("Сумма")) >= big_threshold]
+    if not big:
+        return None
+    big_total = sum(to_float(r.get("Сумма")) for r in big)
+    share = big_total / income_total
+    if share < share_threshold:
+        return None
+    purchase_word = _ru_plural(len(big), "крупная покупка", "крупные покупки", "крупных покупок")
+    return (
+        f"{len(big)} {purchase_word} (от {big_threshold:g}{currency}) — {big_total:g}{currency}, "
+        f"это {share * 100:.0f}% всего дохода периода"
+    )
+
+
+def note_batch_logging_sessions(rows: list[dict], window_seconds: int = 600,
+                                min_items: int = 4, min_sessions: int = 3) -> str | None:
+    """НЕ про деньги — про привычку пользования ботом: несколько РАЗНЫХ
+    категорий вбито почти подряд, похоже на "наверстал ввод за несколько
+    дней сразу", а не на реальный визит одной покупки (см. note_hidden_visits
+    выше — там ровно обратный критерий, одна категория в кластере)."""
+    sessions = 0
+    for cluster in _cluster_by_time(rows, window_seconds):
+        if len(cluster) >= min_items and len({r.get("Категория") for r in cluster}) > 1:
+            sessions += 1
+
+    if sessions < min_sessions:
+        return None
+    session_word = _ru_plural(sessions, "сессия", "сессии", "сессий")
+    return (
+        f"Часть записей вносится не в моменте, а пачками ({sessions} {session_word} за период, "
+        f"когда сразу несколько разных покупок вбито подряд) — если дата покупки важна "
+        f"отдельно от даты ввода, это стоит иметь в виду"
+    )
+
+
+def compute_period_notes(rows: list[dict], income_total: float, currency: str,
+                         period_days: int) -> list[str]:
+    """Собирает все 5 заметок разом — каждая проходит СВОЙ порог значимости
+    независимо (см. docstring каждой note_* функции выше). Молчание по
+    умолчанию: если ни одна не набрала порог, список пустой, а не пять
+    натянутых пунктов ради заполнения места."""
+    notes: list[str] = []
+    notes.extend(note_category_shape(rows, currency))
+    notes.extend(note_hidden_visits(rows, currency))
+    notes.extend(note_frequency(rows, period_days))
+    big_note = note_big_purchases_share_of_income(rows, income_total, currency)
+    if big_note:
+        notes.append(big_note)
+    batch_note = note_batch_logging_sessions(rows)
+    if batch_note:
+        notes.append(batch_note)
+    return notes
+
+

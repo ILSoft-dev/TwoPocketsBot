@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 
 import supabase_client as db
 import cars
+import backdate
 from google_oauth import build_auth_url
 from states import OnboardingStates
 from config import GUIDE_URL
@@ -35,6 +36,8 @@ HELP_TEXT = (
     "/undo — отменить последнюю запись\n"
     "/settings — валюта, период\n"
     "/resync — пересобрать кэш из таблицы\n"
+    "/edit — изменить дату записи\n"
+    "/backdate — вносить траты задним числом\n"
     "/cars — машины\n"
     "/carstats — статистика по машине\n"
     "/guide — подробная инструкция"
@@ -56,6 +59,11 @@ async def cmd_start(message: Message, state: FSMContext):
     # "хлеб 2р" однажды перехватилась как "новое имя категории" для ранее
     # брошенного /categories → переименовать.
     await state.clear()
+    # backdate.py хранит активный режим "задним числом" ОТДЕЛЬНО от FSM
+    # state (см. его docstring — намеренно, чтобы сосуществовать с любым
+    # другим диалогом), поэтому state.clear() выше её не коснётся — чистим
+    # явно, тем же принципом "/start отменяет всё".
+    await backdate.clear(message.from_user.id)
     user = db.get_or_create_user(message.from_user.id, message.from_user.username)
 
     if user.get("onboarding_done"):

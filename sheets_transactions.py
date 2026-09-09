@@ -161,28 +161,39 @@ async def get_all_time_totals(user_id: int) -> tuple[float, float]:
 # --------------------------------------------------------------- writing ----
 async def save_transaction(user_id: int, who: str, amount: float, tx_type: str,
                            category: str, source: str, comment: str = "",
-                           quantity: float | None = None, unit: str | None = None) -> str:
+                           quantity: float | None = None, unit: str | None = None,
+                           override_datetime: datetime | None = None) -> str:
+    """override_datetime — для режима "задним числом" (backdate.py): пишет
+    транзакцию с этой датой вместо текущего момента. Дедуп-проверка тоже
+    сверяется относительно неё, а не реального "сейчас" — иначе несколько
+    трат, вносимых подряд с одной и той же исторической датой, никогда бы
+    не считались "недавним повтором" (120-секундное окно сравнивалось бы
+    с датами месячной давности)."""
     account = _get_account(user_id)
+    effective_now = override_datetime or datetime.now(timezone.utc)
     try:
         existing = await _all_tx_rows_for_account(account)
-        dup = tx_logic.find_recent_duplicate(existing, who, amount, comment or "")
+        dup = tx_logic.find_recent_duplicate(existing, who, amount, comment or "", now=effective_now)
         if dup:
             return dup.get("ID") or ""
     except Exception:
         logger.exception("save_transaction: duplicate check failed, writing anyway")
 
+    now = effective_now.isoformat()  # считаем один раз — раньше sc.now_iso()
+                                      # вызывался дважды (запись + зеркало) и
+                                      # мог тихо разойтись на миллисекунды
     box = google_api.TokenBox(account)
     async with sc.new_session() as session:
         async def _do(token):
             return await sc.append_row(
                 session, token, account["google_spreadsheet_id"], sc.SHEET_TRANSACTIONS,
-                [sc.now_iso(), who, tx_type, category, amount, source, comment, STATUS_ACTIVE,
+                [now, who, tx_type, category, amount, source, comment, STATUS_ACTIVE,
                  quantity if quantity is not None else "", unit or ""],
             )
         row_id = await google_api.call(box, _do)
 
     await asyncio.to_thread(db.mirror_upsert_row, account["id"], {
-        "ID": row_id, "Дата и время": sc.now_iso(), "Кто": who, "Тип": tx_type,
+        "ID": row_id, "Дата и время": now, "Кто": who, "Тип": tx_type,
         "Категория": category, "Сумма": amount, "Источник": source,
         "Комментарий": comment, "Статус": STATUS_ACTIVE,
         "Количество": quantity if quantity is not None else "", "Единица": unit or "",
@@ -193,15 +204,18 @@ async def save_transaction(user_id: int, who: str, amount: float, tx_type: str,
 async def save_auto_expense(user_id: int, who: str, amount: float, tx_type: str,
                             car_name: str, auto_type: str, description: str,
                             mileage: float | None, source: str,
-                            quantity: float | None = None, unit: str | None = None) -> tuple[str, str]:
+                            quantity: float | None = None, unit: str | None = None,
+                            override_datetime: datetime | None = None) -> tuple[str, str]:
     """Writes both the general Транзакции row (so /report totals include
     it like any other expense) and the structured Авто row. Also logs a
     mileage point if one was mentioned in the message. Returns
-    (transactions_row_id, auto_row_id)."""
+    (transactions_row_id, auto_row_id). override_datetime — см. docstring
+    save_transaction выше, тот же смысл и для дедуп-проверки."""
     account = _get_account(user_id)
+    effective_now = override_datetime or datetime.now(timezone.utc)
     try:
         existing = await _all_tx_rows_for_account(account)
-        dup = tx_logic.find_recent_duplicate(existing, who, amount, description or "")
+        dup = tx_logic.find_recent_duplicate(existing, who, amount, description or "", now=effective_now)
         if dup:
             return dup.get("ID") or "", ""
     except Exception:
@@ -212,7 +226,7 @@ async def save_auto_expense(user_id: int, who: str, amount: float, tx_type: str,
     mileage_id = sc.new_row_id() if mileage is not None else None
     box = google_api.TokenBox(account)
     sid = account["google_spreadsheet_id"]
-    now = sc.now_iso()
+    now = effective_now.isoformat()
     async with sc.new_session() as session:
         async def _do_tx(token):
             if await sc.row_id_exists(session, token, sid, sc.SHEET_TRANSACTIONS, tx_id):
@@ -267,6 +281,48 @@ async def save_mileage_point(user_id: int, who: str, car_name: str, mileage: flo
                 [sc.now_iso(), car_name, mileage, source, who],
             )
         return await google_api.call(box, _do)
+
+
+# --------------------------------------------------------------- /edit -------
+async def get_own_transactions(user_id: int, who: str) -> list[dict]:
+    """Активные транзакции, принадлежащие именно `who` (не всей семье, даже
+    если счёт общий) — для списка в /edit. Тот же scope, что уже у /undo:
+    видишь и правишь только своё."""
+    rows = await _all_tx_rows(user_id)
+    active = tx_logic.filter_active_in_range(rows, None, None)
+    own = tx_logic.filter_by_who(active, who)
+    return tx_logic.sort_by_date_desc(own)
+
+
+async def update_transaction_date(user_id: int, who: str, row_id: str, new_date) -> bool:
+    """Меняет дату (сохраняя исходное время суток — время не спрашиваем,
+    только дату) у СВОЕЙ активной транзакции. False, если строка не
+    найдена, чужая или уже удалена (в любом из этих случаев ничего не
+    трогаем — вызывающий код сам решает, что сказать пользователю)."""
+    account = _get_account(user_id)
+    rows = await _all_tx_rows_for_account(account)
+    row = next((r for r in rows if r.get("ID") == row_id), None)
+    if not row or row.get("Кто") != who or row.get("Статус") != STATUS_ACTIVE:
+        return False
+
+    old_dt = tx_logic.parse_dt(row.get("Дата и время"))
+    old_time = old_dt.timetz() if old_dt else datetime.now(timezone.utc).timetz()
+    new_dt = datetime.combine(new_date, old_time)
+    new_value = new_dt.isoformat()
+
+    box = google_api.TokenBox(account)
+    async with sc.new_session() as session:
+        async def _do(token):
+            return await sc.update_cell(
+                session, token, account["google_spreadsheet_id"],
+                sc.SHEET_TRANSACTIONS, row_id, "Дата и время", new_value,
+            )
+        found = await google_api.call(box, _do)
+    if not found:
+        return False
+
+    await asyncio.to_thread(db.mirror_update_date, row_id, new_value)
+    return True
 
 
 # --------------------------------------------------------------- /undo -------

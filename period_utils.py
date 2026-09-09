@@ -8,7 +8,7 @@ period_start из report.py. Здесь нет импортов из други�
 только datetime/calendar, поэтому от period_utils.py можно зависеть кому
 угодно без риска цикла.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from calendar import monthrange
 
 MONTH_NAMES = {
@@ -90,6 +90,16 @@ def previous_period_bounds(since: datetime, until, period_type: str) -> tuple[da
     effective_until = until or datetime.now(timezone.utc)
     length = effective_until - since
     return since - length, since
+
+
+def is_period_end_today(month_start_day: int) -> bool:
+    """True exactly once per period: the day before the NEXT period starts
+    (works for any month_start_day 1-28 regardless of month length). Общая
+    точка входа для всего, что должно сработать РОВНО раз на закрытии
+    периода — car_stats.py (месячная статистика) и narrative_report.py
+    (структурные заметки, см. run_period_notes_sweep)."""
+    tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+    return tomorrow.day == month_start_day
 
 
 def format_date_human(iso_value) -> str:

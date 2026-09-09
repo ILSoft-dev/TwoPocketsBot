@@ -18,6 +18,7 @@ import sheets_client as sc
 import cars
 import google_api
 from report import period_start
+from period_utils import is_period_end_today
 
 CATEGORY_LABELS = {
     "Заправка": "на бензин",
@@ -97,12 +98,6 @@ def format_stats_text(car_name: str, stats: dict, currency: str, period_label: s
 
 
 # --------------------------------------------------------- automatic sweep --
-def _is_period_end_today(month_start_day: int) -> bool:
-    """True exactly once per period: the day before the NEXT period starts
-    (works for any month_start_day 1-28 regardless of month length)."""
-    tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
-    return tomorrow.day == month_start_day
-
 
 async def run_monthly_stats_sweep(bot) -> int:
     """Called from the cron web route (same daily ping as reminders.py).
@@ -114,7 +109,7 @@ async def run_monthly_stats_sweep(bot) -> int:
         if not owner:
             continue
         month_start_day = owner.get("month_start", 1)
-        if not _is_period_end_today(month_start_day):
+        if not is_period_end_today(month_start_day):
             continue
 
         active_cars = await cars.list_active_cars(account)

@@ -48,3 +48,18 @@ class CarManageStates(StatesGroup):
     не путать 'иду по онбордингу' с 'просто добавляю машину из /cars'."""
     waiting_new_name = State()
     waiting_new_mileage = State()
+
+
+class BackdateStates(StatesGroup):
+    """Только для шага ВЫБОРА даты (после /backdate, кнопка 'Другая дата').
+    Сама активная сессия 'задним числом' — это НЕ FSM-состояние (см.
+    backdate.py) — она должна сосуществовать с любым другим состоянием
+    (уточнение категории, дизамбигуация машины и т.п.), а не блокировать
+    обычный ввод трат на время своего действия."""
+    waiting_custom_date = State()
+
+
+class EditStates(StatesGroup):
+    """/edit — после выбора конкретной транзакции кнопкой, ждём новую дату
+    текстом."""
+    waiting_new_date = State()

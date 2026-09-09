@@ -36,6 +36,7 @@ import cars
 import auto_expense
 import fluid_tracker
 import insights
+import backdate
 from parser import parse_amount, guess_type, extract_quantity
 from config import forced_category, looks_like_question
 from keyboards import category_choice_keyboard, car_choice_keyboard
@@ -102,9 +103,10 @@ def resolve_income_category(remainder: str) -> tuple[str, bool]:
 async def save_and_confirm(message: Message, user_id: int, who: str, amount: float,
                            tx_type: str, category: str, source: str, comment: str = "",
                            quantity: float | None = None, unit: str | None = None):
+    backdate_dt = await backdate.get_active_date(user_id)
     try:
         await tx.save_transaction(user_id, who, amount, tx_type, category, source, comment,
-                                  quantity=quantity, unit=unit)
+                                  quantity=quantity, unit=unit, override_datetime=backdate_dt)
     except tx.NoGoogleAccount:
         await message.answer("Google Drive не подключён — пройди заново /start, чтобы подключить.")
         return
@@ -115,16 +117,25 @@ async def save_and_confirm(message: Message, user_id: int, who: str, amount: flo
             "переподключи через /start."
         )
         return
-    await react_ok(message)
+    if backdate_dt:
+        # Явный текст с датой на КАЖДОЕ подтверждение, не тихая реакция —
+        # см. backdate.py docstring про защиту от того, чтобы человек забыл,
+        # что режим всё ещё активен, и следующая обычная трата ушла не тем
+        # числом.
+        await message.answer(f"✅ Записано на {backdate_dt.strftime('%d.%m.%Y')}")
+    else:
+        await react_ok(message)
 
 
 async def finalize_auto_expense(message: Message, user_id: int, who: str, amount: float,
                                 tx_type: str, car_name: str, auto_type: str,
                                 description: str, mileage: float | None, source: str,
                                 quantity: float | None = None, unit: str | None = None):
+    backdate_dt = await backdate.get_active_date(user_id)
     try:
         await tx.save_auto_expense(user_id, who, amount, tx_type, car_name, auto_type,
-                                   description, mileage, source, quantity=quantity, unit=unit)
+                                   description, mileage, source, quantity=quantity, unit=unit,
+                                   override_datetime=backdate_dt)
     except tx.NoGoogleAccount:
         await message.answer("Google Drive не подключён — пройди заново /start, чтобы подключить.")
         return
@@ -135,7 +146,10 @@ async def finalize_auto_expense(message: Message, user_id: int, who: str, amount
             "переподключи через /start."
         )
         return
-    await react_ok(message)
+    if backdate_dt:
+        await message.answer(f"✅ Записано на {backdate_dt.strftime('%d.%m.%Y')}")
+    else:
+        await react_ok(message)
     if mileage is not None:
         await maybe_warn_fluids(message, user_id, car_name, mileage)
 

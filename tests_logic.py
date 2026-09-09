@@ -15,6 +15,14 @@ from tx_logic import (
     sum_all_time,
     STATUS_ACTIVE,
     STATUS_DELETED,
+    parse_user_date,
+    filter_by_who,
+    sort_by_date_desc,
+    compute_period_notes,
+    note_category_shape,
+    note_hidden_visits,
+    note_batch_logging_sessions,
+    note_big_purchases_share_of_income,
 )
 
 
@@ -92,6 +100,91 @@ def test_duplicate_window():
     assert find_recent_duplicate(rows, "ann", 40, "бензин", now=now, window_seconds=10) is None
 
 
+def test_parse_user_date():
+    from datetime import date
+    today = date(2026, 9, 9)
+    assert parse_user_date("25.08", today=today) == date(2026, 8, 25)
+    assert parse_user_date("25.08.2026", today=today) == date(2026, 8, 25)
+    assert parse_user_date("25.08.26", today=today) == date(2026, 8, 25)
+    assert parse_user_date("не дата", today=today) is None
+    # будущая дата (даже без явного года) — честно отклоняется, не гадаем про год
+    assert parse_user_date("15.09", today=today) is None
+    assert parse_user_date("25.12", today=date(2026, 1, 5)) is None
+    # с явным годом — ок, даже если это "прошлый год" относительно today
+    assert parse_user_date("25.12.25", today=date(2026, 1, 5)) == date(2025, 12, 25)
+    # дальше двух лет назад — отклоняется
+    assert parse_user_date("01.01.20", today=today) is None
+
+
+def test_filter_by_who_and_sort():
+    rows = [
+        {"ID": "a", "Кто": "ilya", "Дата и время": "2026-08-01T10:00:00+00:00"},
+        {"ID": "b", "Кто": "anna", "Дата и время": "2026-08-02T10:00:00+00:00"},
+        {"ID": "c", "Кто": "ilya", "Дата и время": "2026-08-03T10:00:00+00:00"},
+    ]
+    own = filter_by_who(rows, "ilya")
+    assert [r["ID"] for r in own] == ["a", "c"]
+    assert [r["ID"] for r in sort_by_date_desc(own)] == ["c", "a"]
+
+
+def _tx(dt, cat, amount, tx_type="expense", who="ilya"):
+    return {"Дата и время": dt, "Категория": cat, "Сумма": amount, "Тип": tx_type, "Кто": who}
+
+
+def test_period_notes_category_shape():
+    rows = [
+        _tx("2026-08-12T08:00:00+00:00", "Детское питание", 358),
+        _tx("2026-08-30T09:00:00+00:00", "Детское питание", 227),
+    ]
+    for i in range(20):
+        rows.append(_tx(f"2026-08-{(i % 28) + 1:02d}T10:{i:02d}:00+00:00", "Продукты", 5 + i))
+    notes = note_category_shape(rows, "₽")
+    assert any("Детское питание" in n and "почти целиком" in n for n in notes)
+    assert any("Продукты" in n and "без явного лидера" in n for n in notes)
+
+
+def test_period_notes_hidden_visits_vs_batch_session():
+    rows = [
+        # одна категория почти подряд — "скрытый визит"
+        _tx("2026-08-18T11:26:00+00:00", "Продукты", 3.33),
+        _tx("2026-08-18T11:26:30+00:00", "Продукты", 2.38),
+        _tx("2026-08-18T11:27:00+00:00", "Продукты", 4.68),
+        _tx("2026-08-18T11:27:30+00:00", "Продукты", 3.00),
+        # разные категории почти подряд — "сессия пакетного ввода", НЕ визит
+        _tx("2026-08-04T15:42:00+00:00", "Досуг", 5.3),
+        _tx("2026-08-04T15:42:30+00:00", "Продукты", 2.17),
+        _tx("2026-08-04T15:43:00+00:00", "Детское питание", 226.64),
+        _tx("2026-08-04T15:43:30+00:00", "Лекарства", 81),
+    ]
+    visits = note_hidden_visits(rows, "₽", min_total=5)
+    assert len(visits) == 1 and "18.08" in visits[0] and "Продукты" in visits[0]
+
+    batch = note_batch_logging_sessions(rows, min_sessions=1)
+    assert batch is not None and "1 сессия" in batch  # склонение: 1 -> "сессия", не "сессий"
+
+
+def test_period_notes_big_purchases_share():
+    rows = [_tx("2026-08-12T08:00:00+00:00", "Хозтовары", 800)]
+    note = note_big_purchases_share_of_income(rows, income_total=1000, currency="₽")
+    assert note is not None and "80%" in note
+    # при огромном доходе доля незначима — заметки быть не должно
+    assert note_big_purchases_share_of_income(rows, income_total=1_000_000, currency="₽") is None
+
+
+def test_period_notes_silence_on_thin_data():
+    rows = [_tx("2026-08-01T10:00:00+00:00", "Продукты", 15)]
+    notes = compute_period_notes(rows, income_total=1000, currency="₽", period_days=28)
+    assert notes == []  # почти пустые данные -> молчание, не натянутые заметки
+
+
+def test_ru_plural_boundaries():
+    from tx_logic import _ru_plural
+    cases = {1: "покупка", 2: "покупки", 4: "покупки", 5: "покупок",
+             11: "покупок", 12: "покупок", 21: "покупка", 25: "покупок"}
+    for n, expected in cases.items():
+        assert _ru_plural(n, "покупка", "покупки", "покупок") == expected, n
+
+
 if __name__ == "__main__":
     test_forced_category()
     test_looks_like_question()
@@ -99,4 +192,11 @@ if __name__ == "__main__":
     test_soft_undo()
     test_cash_on_hand()
     test_duplicate_window()
+    test_parse_user_date()
+    test_filter_by_who_and_sort()
+    test_period_notes_category_shape()
+    test_period_notes_hidden_visits_vs_batch_session()
+    test_period_notes_big_purchases_share()
+    test_period_notes_silence_on_thin_data()
+    test_ru_plural_boundaries()
     print("All logic tests passed.")

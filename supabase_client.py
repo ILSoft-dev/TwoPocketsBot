@@ -318,6 +318,17 @@ def mirror_mark_deleted(sheet_row_id: str) -> None:
         logger.warning("tx_mirror mark deleted skipped", exc_info=True)
 
 
+def mirror_update_date(sheet_row_id: str, new_date_time: str) -> None:
+    """Точечный UPDATE одного поля, не upsert — upsert с частичным payload
+    заменил бы всю строку зеркала (занулив категорию/сумму/статус и т.д.),
+    потому что Supabase upsert по умолчанию не мёрджит, а перезаписывает.
+    Тот же принцип, что и у mirror_mark_deleted выше."""
+    try:
+        db.table("tx_mirror").update({"date_time": new_date_time}).eq("sheet_row_id", sheet_row_id).execute()
+    except Exception:
+        logger.warning("tx_mirror update date skipped", exc_info=True)
+
+
 def mirror_rename_category(owner_user_id: int | None, old_name: str, new_name: str) -> None:
     try:
         q = db.table("tx_mirror").update({"category": new_name}).eq("category", old_name)

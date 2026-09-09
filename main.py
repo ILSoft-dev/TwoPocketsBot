@@ -15,6 +15,7 @@ import sheets_transactions as tx
 import narrative_report
 import reminders
 import car_stats
+import backdate
 
 # Роутеры — порядок важен! Команды и FSM-специфичные хендлеры должны
 # регистрироваться РАНЬШЕ input_handler (там generic F.text/F.voice/F.photo,
@@ -29,6 +30,7 @@ import undo
 import cars_command
 import car_stats_command
 import resync
+import edit
 import input_handler
 
 logging.basicConfig(level=logging.INFO)
@@ -46,6 +48,9 @@ BOT_COMMANDS = [
     BotCommand(command="carstats", description="📈 Статистика по машине"),
     BotCommand(command="settings", description="⚙️ Валюта, период"),
     BotCommand(command="resync", description="🔄 Пересобрать кэш из Google-таблицы"),
+    BotCommand(command="edit", description="✏️ Изменить дату существующей записи"),
+    BotCommand(command="backdate", description="🕐 Вносить траты задним числом"),
+    BotCommand(command="done", description="✅ Выйти из режима «задним числом»"),
 ]
 
 
@@ -59,9 +64,10 @@ async def daily_cron(request: web.Request) -> web.Response:
     ежемесячная статистика (car_stats.py сам решает, у кого сегодня конец
     периода), сверка зеркала транзакций (tx_mirror) с реальным Sheets —
     страховка от тихого расхождения, см. sheets_transactions.py changelog
-    v1.4 — и годовой отчёт (narrative_report.py сам решает, что сегодня
-    1 января, иначе сразу возвращает 0). Один пинг UptimeRobot закрывает
-    всё сразу."""
+    v1.4 — годовой отчёт (narrative_report.py сам решает, что сегодня
+    1 января, иначе сразу возвращает 0) — и структурные заметки за
+    закрытый период (тот же принцип "сам решает, что сегодня закрытие").
+    Один пинг UptimeRobot закрывает всё сразу."""
     if CRON_SECRET and request.query.get("secret") != CRON_SECRET:
         return web.Response(status=403, text="forbidden")
     bot = request.app["bot"]
@@ -69,10 +75,12 @@ async def daily_cron(request: web.Request) -> web.Response:
     stats_sent = await car_stats.run_monthly_stats_sweep(bot)
     mirrors_fixed = await tx.run_mirror_reconcile_sweep()
     annual_sent = await narrative_report.run_annual_report_sweep(bot)
+    notes_sent = await narrative_report.run_period_notes_sweep(bot)
     return web.Response(
         text=(
             f"ok, reminders_sent={reminders_sent}, stats_sent={stats_sent}, "
-            f"mirrors_fixed={mirrors_fixed}, annual_sent={annual_sent}"
+            f"mirrors_fixed={mirrors_fixed}, annual_sent={annual_sent}, "
+            f"notes_sent={notes_sent}"
         )
     )
 
@@ -125,6 +133,8 @@ async def main():
     storage = RedisStorage.from_url(REDIS_URL, connection_kwargs=redis_connection_kwargs())
     dp = Dispatcher(storage=storage)
 
+    dp.message.middleware(backdate.SessionMiddleware())  # см. backdate.py — до ЛЮБОГО хендлера
+
     dp.include_router(start.router)
     dp.include_router(report.router)
     dp.include_router(history.router)
@@ -135,6 +145,8 @@ async def main():
     dp.include_router(cars_command.router)
     dp.include_router(car_stats_command.router)
     dp.include_router(resync.router)
+    dp.include_router(edit.router)
+    dp.include_router(backdate.router)
     dp.include_router(input_handler.router)  # последний
 
     await run_health_server(bot, storage)  # для UptimeRobot + OAuth-callback на Render
