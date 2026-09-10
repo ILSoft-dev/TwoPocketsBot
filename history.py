@@ -9,6 +9,13 @@ history.py
 Суммы всегда отображаются с двумя знаками после десятичного разделителя.
 
 Changelog:
+- категория в скобках рядом с описанием покупки ("Хлеб (Продукты)") —
+  чтобы сразу видеть, что трата легла в верную категорию, не открывая
+  таблицу. Особенно полезно для авто-трат (Топливо/Ремонт-ТО/Запчасти/
+  Прочее — см. auto_expense.py) — ошибка классификации там не всегда
+  заметна на глаз, а тут видна сразу. Не дублируется, если категория и так
+  уже показана как название покупки (типичный случай для старых записей
+  без комментария, где label — это и есть fallback на категорию).
 - под каждым днём — итоговая строка "Расход: X, Доход: Y" за этот день;
   если за день не было дохода (или расхода) — так и пишем "0", а не
   пропускаем строку молча, чтобы сразу было видно полную картину дня.
@@ -66,6 +73,16 @@ def _clean_label(row: dict) -> str:
 
     category = str(row.get("Категория", "") or "").strip()
     return category or "Без описания"
+
+
+def _category_suffix(row: dict, label: str) -> str:
+    """Категория в скобках рядом с описанием — см. changelog выше. Пусто,
+    если категории нет, или если label и так уже равен категории (чтобы
+    не получить "Продукты (Продукты)" на старых записях без комментария)."""
+    category = str(row.get("Категория", "") or "").strip()
+    if not category or category.lower() == label.strip().lower():
+        return ""
+    return f" ({category})"
 
 
 @router.message(Command("history"))
@@ -134,7 +151,7 @@ async def cmd_history(message: Message, command: CommandObject):
         else:
             day_expense += amount_dec
 
-        lines.append(f"{sign}{amount_str} {currency} — {label}")
+        lines.append(f"{sign}{amount_str} {currency} — {label}{_category_suffix(row, label)}")
 
     flush_day_total()  # итог последнего дня — цикл его не закрывает
 
