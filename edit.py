@@ -229,24 +229,37 @@ async def edit_field_choice(callback: CallbackQuery, state: FSMContext):
         return
 
 
-async def _apply_field_update(message: Message, state: FSMContext, updater, *args,
-                              success_text: str, not_found_text: str) -> None:
+async def _apply_field_update(reply_target: Message, state: FSMContext, tg_user: User,
+                              updater, *args, success_text: str, not_found_text: str) -> None:
     """Общий хвост для всех трёх правок — вызов update_transaction_*,
-    одинаковая обработка ошибок/scope, один раз, не три копии."""
+    одинаковая обработка ошибок/scope, один раз, не три копии.
+
+    reply_target — КУДА слать ответ (может быть callback.message, если
+    вызывается из callback-хендлера — у Message есть .answer(), шлёт в тот
+    же чат независимо от того, чьё это сообщение технически).
+
+    tg_user — РЕАЛЬНЫЙ человек, совершивший действие. Для message-хендлеров
+    это message.from_user. Для callback-хендлеров ОБЯЗАТЕЛЬНО
+    callback.from_user, а НЕ callback.message.from_user — то сообщение
+    отправил сам бот (там кнопки), и .from_user на нём — это бот, не
+    человек. Баг именно с этим и был: клик по кнопке категории создавал
+    фейковую "учётку" на Telegram ID бота, у нее закономерно не было
+    Google-аккаунта — отсюда ложное "Google Drive не подключён" при
+    абсолютно рабочем реальном аккаунте пользователя."""
     data = await state.get_data()
     row_id = data.get("edit_row_id")
-    user = db.get_or_create_user(message.from_user.id, message.from_user.username)
-    who = who_label(message.from_user)
+    user = db.get_or_create_user(tg_user.id, tg_user.username)
+    who = who_label(tg_user)
 
     try:
         ok = await updater(user["id"], who, row_id, *args)
     except tx.NoGoogleAccount:
-        await message.answer("Google Drive не подключён — пройди заново /start, чтобы подключить.")
+        await reply_target.answer("Google Drive не подключён — пройди заново /start, чтобы подключить.")
         await state.clear()
         return
     except Exception:
         logging.exception("edit.py: unexpected error updating transaction")
-        await message.answer(
+        await reply_target.answer(
             "Не получилось сохранить изменение. Если повторится — "
             "переподключи через /start."
         )
@@ -255,9 +268,9 @@ async def _apply_field_update(message: Message, state: FSMContext, updater, *arg
 
     await state.clear()
     if not ok:
-        await message.answer(not_found_text)
+        await reply_target.answer(not_found_text)
         return
-    await message.answer(success_text)
+    await reply_target.answer(success_text)
 
 
 @router.message(EditStates.waiting_new_date)
@@ -270,7 +283,7 @@ async def edit_new_date(message: Message, state: FSMContext):
         )
         return
     await _apply_field_update(
-        message, state, tx.update_transaction_date, new_date,
+        message, state, message.from_user, tx.update_transaction_date, new_date,
         success_text=f"✅ Дата изменена на {new_date.strftime('%d.%m.%Y')}",
         not_found_text="Не нашёл эту запись (может, её уже удалили, или это была "
                        "не твоя запись). Попробуй /edit заново.",
@@ -284,7 +297,7 @@ async def edit_new_amount(message: Message, state: FSMContext):
         await message.answer("Не понял сумму. Просто число, например 150 или 34.99")
         return
     await _apply_field_update(
-        message, state, tx.update_transaction_amount, new_amount,
+        message, state, message.from_user, tx.update_transaction_amount, new_amount,
         success_text=f"✅ Сумма изменена на {new_amount:g}",
         not_found_text="Не нашёл эту запись (может, её уже удалили, или это была "
                        "не твоя запись). Попробуй /edit заново.",
@@ -295,7 +308,7 @@ async def edit_new_amount(message: Message, state: FSMContext):
 async def edit_category_chosen(callback: CallbackQuery, state: FSMContext):
     category = callback.data.split(":", 1)[1]
     await _apply_field_update(
-        callback.message, state, tx.update_transaction_category, category,
+        callback.message, state, callback.from_user, tx.update_transaction_category, category,
         success_text=f"✅ Категория изменена на «{category}»",
         not_found_text="Не нашёл эту запись (может, её уже удалили, или это была "
                        "не твоя запись). Попробуй /edit заново.",
@@ -331,7 +344,7 @@ async def edit_category_new_name(message: Message, state: FSMContext):
             return
 
     await _apply_field_update(
-        message, state, tx.update_transaction_category, name,
+        message, state, message.from_user, tx.update_transaction_category, name,
         success_text=f"✅ Категория изменена на «{name}»",
         not_found_text="Не нашёл эту запись (может, её уже удалили, или это была "
                        "не твоя запись). Попробуй /edit заново.",
