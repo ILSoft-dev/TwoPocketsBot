@@ -188,13 +188,23 @@ async def ask_car_disambiguation(message: Message, state: FSMContext, active_car
 async def route_auto_expense(message: Message, state: FSMContext, user_id: int, who: str,
                              amount: float, tx_type: str, source: str, remainder: str,
                              quantity: float | None = None, unit: str | None = None,
-                             preferred_type: str | None = None):
+                             preferred_type: str | None = None, item_text: str | None = None):
     """preferred_type — если человек ЯВНО выбрал одну из авто-категорий сам
     (кнопкой в диалоге уточнения, а не через forced_category/category_map/
     угадывание Groq), его выбор побеждает классификатор по тексту. Иначе
     редкое, но реальное несоответствие: нажал "Запчасти", а
     classify_auto_type по тексту решил "Ремонт/ТО" — и записалось не то,
-    что человек только что подтвердил."""
+    что человек только что подтвердил.
+
+    item_text — remainder БЕЗ количества/единицы (parser.extract_quantity),
+    используется как база для КОММЕНТАРИЯ (после чистки марки через
+    cars.clean_description) — без этого "40 л бензин opel" писалось бы в
+    комментарий целиком, хотя количество уже отдельно лежит в своей
+    колонке. remainder (полный, с числами) по-прежнему используется для
+    распознавания машины/пробега/типа — там числа наоборот нужны
+    (extract_mileage ищет "... км" по всему тексту). Если item_text не
+    передан — используем remainder как есть, просто без дополнительной
+    чистки."""
     account = db.get_effective_google_account(user_id)
     try:
         active_cars = await cars.list_active_cars(account) if account else []
@@ -206,25 +216,29 @@ async def route_auto_expense(message: Message, state: FSMContext, user_id: int, 
         )
         return
 
+    base_description = item_text if item_text is not None else remainder
     matched_name = cars.match_car_name(remainder, active_cars)
     mileage = auto_expense.extract_mileage(remainder)
     auto_type = preferred_type or auto_expense.classify_auto_type(remainder)
 
     if matched_name:
+        description = cars.clean_description(base_description, matched_name)
         await finalize_auto_expense(message, user_id, who, amount, tx_type, matched_name,
-                                    auto_type, remainder, mileage, source, quantity, unit)
+                                    auto_type, description, mileage, source, quantity, unit)
         await state.clear()
         return
 
     if len(active_cars) == 1:
-        await finalize_auto_expense(message, user_id, who, amount, tx_type, active_cars[0]["Машина"],
-                                    auto_type, remainder, mileage, source, quantity, unit)
+        only_car = active_cars[0]["Машина"]
+        description = cars.clean_description(base_description, only_car)
+        await finalize_auto_expense(message, user_id, who, amount, tx_type, only_car,
+                                    auto_type, description, mileage, source, quantity, unit)
         await state.clear()
         return
 
     await state.update_data(pending_intent="auto_expense", pending_payload={
         "amount": amount, "tx_type": tx_type, "auto_type": auto_type,
-        "description": remainder, "mileage": mileage, "source": source,
+        "description": base_description, "mileage": mileage, "source": source,
         "quantity": quantity, "unit": unit,
     })
     await ask_car_disambiguation(message, state, active_cars)
@@ -410,9 +424,10 @@ async def resolve_pending_intent(message: Message, state: FSMContext, user_id: i
     payload = data.get("pending_payload", {})
 
     if intent == "auto_expense":
+        description = cars.clean_description(payload["description"], car_name)
         await finalize_auto_expense(
             message, user_id, who, payload["amount"], payload["tx_type"], car_name,
-            payload["auto_type"], payload["description"], payload["mileage"], payload["source"],
+            payload["auto_type"], description, payload["mileage"], payload["source"],
             payload.get("quantity"), payload.get("unit"),
         )
     elif intent == "mileage_update":
@@ -486,7 +501,7 @@ async def new_category_named(message: Message, state: FSMContext):
         await route_auto_expense(
             message, state, user["id"], who,
             data["amount"], data["tx_type"], data["source"], remainder, quantity, unit,
-            preferred_type=name,
+            preferred_type=name, item_text=item_text,
         )
         return
 
@@ -513,7 +528,7 @@ async def category_chosen(callback: CallbackQuery, state: FSMContext):
         await route_auto_expense(
             callback.message, state, user["id"], who,
             data["amount"], data["tx_type"], data["source"], remainder, quantity, unit,
-            preferred_type=category,
+            preferred_type=category, item_text=item_text,
         )
         # route_auto_expense сам решает, чистить ли state (может понадобиться
         # дизамбигуация машины — тогда state переходит в CarResolutionStates)
@@ -581,7 +596,7 @@ async def process_text_input(message: Message, state: FSMContext, text: str, sou
 
     if category in AUTO_CATEGORIES:
         await route_auto_expense(message, state, user["id"], who, amount, tx_type, source, remainder,
-                                 quantity, unit)
+                                 quantity, unit, item_text=item_text)
         return
 
     await save_and_confirm(message, user["id"], who, amount, tx_type, category, source,

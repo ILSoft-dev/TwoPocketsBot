@@ -1,8 +1,15 @@
 """
 cars.py
-v1.4 - car registry + mileage logging, backed by Google Sheets (sheets_client.py)
+v1.5 - car registry + mileage logging, backed by Google Sheets (sheets_client.py)
 
 Changelog:
+- v1.5: match_car_name() теперь понимает алиасы марки (CAR_ALIAS_GROUPS) —
+        "opel" находит зарегистрированную "Опель", "daewoo"/"дэу"/"matiz"
+        находят "Матиз" — не только точное совпадение зарегистрированного
+        имени. Плюс clean_description() — убирает из комментария сырой
+        алиас ("40 л бензин opel") и подставляет канонiчное имя машины
+        ("бензин Опель"), чтобы в /history не плодились вперемешку разные
+        написания одной и той же машины.
 - v1.4: get_last_auto_event() теперь возвращает (событие, число_подходящих)
         вместо просто события — insights.py показывает "(всего N раз)" в
         ответе на "когда менял...", если подходящих записей больше одной,
@@ -27,6 +34,52 @@ callers pass in the account dict already resolved via
 supabase_client.get_effective_google_account().
 """
 import re
+
+# Группы взаимозаменяемых написаний одной марки — используются ТОЛЬКО
+# внутри уже определённой авто-траты (после classify_auto_type/
+# AUTO_CATEGORIES), чтобы понять, к какой из ЗАРЕГИСТРИРОВАННЫХ машин
+# относится текст, даже если марка написана иначе, чем при регистрации
+# (латиницей, сокращённо, кириллицей). Не влияет на то, определяется ли
+# сообщение как авто-трата вообще — это отдельный, более ранний шаг.
+CAR_ALIAS_GROUPS = [
+    {"опель", "opel"},
+    {"матиз", "matiz", "дэу", "деу", "daewoo"},
+    {"фольксваген", "вольксваген", "volkswagen", "vw", "фольцваген"},
+    {"тойота", "toyota"},
+    {"форд", "ford"},
+    {"рено", "renault"},
+    {"шкода", "skoda", "škoda"},
+    {"лада", "lada", "ваз", "vaz"},
+    {"ниссан", "nissan"},
+    {"хендай", "хёндай", "hyundai"},
+    {"киа", "kia"},
+    {"бмв", "bmw"},
+    {"мерседес", "mercedes", "мерс"},
+    {"ауди", "audi"},
+    {"хонда", "honda"},
+    {"мазда", "mazda"},
+    {"пежо", "peugeot"},
+    {"ситроен", "citroen", "citroën"},
+    {"митсубиси", "мицубиси", "mitsubishi"},
+    {"шевроле", "chevrolet", "шеви", "chevy"},
+    {"вольво", "volvo"},
+    {"субару", "subaru"},
+    {"газель", "газ", "gazelle", "gaz"},
+    {"жигули", "zhiguli"},
+    {"сузуки", "suzuki"},
+    {"сеат", "seat"},
+    {"фиат", "fiat"},
+    {"джили", "geely"},
+    {"чери", "chery"},
+]
+
+
+def _alias_group_for(word: str) -> set[str] | None:
+    word = word.lower().strip()
+    for group in CAR_ALIAS_GROUPS:
+        if word in group:
+            return group
+    return None
 
 import aiohttp
 
@@ -73,14 +126,45 @@ async def list_active_cars(account: dict) -> list[dict]:
 
 
 def match_car_name(text: str, active_cars: list[dict]) -> str | None:
-    """Substring match against registered car names (case-insensitive) —
-    same cheap deterministic approach category_map already uses for
-    keyword->category lookup, no LLM call needed for this."""
+    """Substring match against registered car names (case-insensitive), с
+    учётом алиасов марки (CAR_ALIAS_GROUPS) — "opel" находит "Опель",
+    "daewoo"/"дэу"/"matiz" находят "Матиз", даже если машина
+    зарегистрирована под другим написанием."""
     lowered = text.lower()
     for car in active_cars:
-        if car["Машина"].lower() in lowered:
+        car_name_lower = car["Машина"].lower()
+        if car_name_lower in lowered:
+            return car["Машина"]
+        group = _alias_group_for(car_name_lower)
+        if group and any(alias in lowered for alias in group):
             return car["Машина"]
     return None
+
+
+def clean_description(item_text: str, matched_car_name: str | None) -> str:
+    """Для комментария авто-траты: item_text уже без количества/единицы
+    (см. parser.extract_quantity), здесь убираем ещё и сырое написание
+    марки из текста ("bensin opel" -> "bensin") и подставляем канонiчное
+    зарегистрированное имя в конец ("бензин Опель"). Без этого в /history
+    вперемешку были бы "opel"/"Опель"/"OPEL" — разные написания одной
+    машины, которые выглядят как будто это разные вещи.
+
+    Канонiчное имя оставляем в комментарии (не убираем совсем), а не
+    только в отдельном листе "Авто" — потому что /history читает только
+    общий лист "Транзакции", где отдельной колонки под машину нет; без
+    имени в комментарии там было бы невозможно отличить "бензин" для
+    одной машины от "бензин" для другой при нескольких машинах."""
+    if not matched_car_name:
+        return item_text
+    strip_words = {matched_car_name.lower()}
+    group = _alias_group_for(matched_car_name.lower())
+    if group:
+        strip_words |= group
+
+    tokens = item_text.split()
+    kept = [t for t in tokens if t.lower().strip(".,!?") not in strip_words]
+    cleaned = " ".join(kept).strip()
+    return f"{cleaned} {matched_car_name}".strip() if cleaned else matched_car_name
 
 
 async def get_mileage_distance(account: dict, car_name: str,

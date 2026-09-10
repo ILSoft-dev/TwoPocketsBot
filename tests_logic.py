@@ -1,12 +1,23 @@
 """Тесты без сети: forced_category, вопросы, rename, undo, баланс, дубли."""
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# cars.py тянет за собой supabase_client.py, которому нужны эти переменные
+# уже на этапе импорта (create_client бросает исключение без них) — сами
+# тесты сюда не стучатся, только чтобы модуль вообще импортировался без
+# реального окружения.
+os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
+os.environ.setdefault("SUPABASE_KEY", "dummy")
+os.environ.setdefault("BOT_TOKEN", "123:dummy")
+os.environ.setdefault("GROQ_API_KEY", "dummy")
+
 from config import forced_category, looks_like_question
 import auto_expense
+import cars
 from tx_logic import (
     apply_soft_delete_last,
     balance_on_hand,
@@ -57,6 +68,25 @@ def test_classify_auto_type():
     # регрессия: "шин" — подстрока "маШИНа/маШИНу", раньше ложно триггерило Ремонт
     assert c("Купил новую машину") == "Прочее"
     assert c("Шторка в машину") == "Прочее"
+
+
+def test_car_name_aliases():
+    active_cars = [{"ID": "1", "Машина": "Опель"}, {"ID": "2", "Машина": "Матиз"}]
+    # реальный случай из чата: "40 л бензин opel"
+    assert cars.match_car_name("40 л бензин opel", active_cars) == "Опель"
+    assert cars.match_car_name("бензин Opel", active_cars) == "Опель"
+    for text in ["бензин daewoo", "бензин дэу", "бензин matiz", "ремонт матиз"]:
+        assert cars.match_car_name(text, active_cars) == "Матиз", text
+    assert cars.match_car_name("просто текст без машины", active_cars) is None
+
+
+def test_clean_description():
+    # количество уже убрано до вызова (parser.extract_quantity) — здесь
+    # только чистка марки и подстановка канонiчного имени
+    assert cars.clean_description("бензин opel", "Опель") == "бензин Опель"
+    assert cars.clean_description("бензин Опель", "Опель") == "бензин Опель"  # не задваивает
+    assert cars.clean_description("", "Опель") == "Опель"  # пустое описание -> хотя бы имя машины
+    assert cars.clean_description("что-то без марки", None) == "что-то без марки"  # машина не найдена — не трогаем
 
 
 def test_looks_like_question():
@@ -224,6 +254,8 @@ def test_ru_plural_boundaries():
 if __name__ == "__main__":
     test_forced_category()
     test_classify_auto_type()
+    test_car_name_aliases()
+    test_clean_description()
     test_looks_like_question()
     test_rename_category()
     test_soft_undo()
