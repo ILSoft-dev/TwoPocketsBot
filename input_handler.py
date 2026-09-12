@@ -109,9 +109,16 @@ def resolve_income_category(remainder: str) -> tuple[str, bool]:
 
 # ------------------------------------------------------------- saving ------
 async def save_and_confirm(message: Message, user_id: int, who: str, amount: float,
-                           tx_type: str, category: str, source: str, comment: str = "",
-                           quantity: float | None = None, unit: str | None = None):
-    backdate_dt = await backdate.get_active_date(user_id)
+                           tx_type: str, category: str, source: str, tg_user_id: int,
+                           comment: str = "", quantity: float | None = None, unit: str | None = None):
+    """tg_user_id — Telegram ID (НЕ внутренний Supabase user_id, это два
+    разных числа!) — backdate.py хранит сессию "задним числом" по
+    Telegram ID (доступен без похода в базу из message/callback напрямую),
+    а не по внутреннему id. Раньше здесь по ошибке передавался user_id
+    (внутренний) в backdate.get_active_date — ключи никогда не совпадали,
+    и режим "задним числом" тихо не срабатывал вообще, при этом ничего не
+    падало (просто get_active_date всегда возвращал None)."""
+    backdate_dt = await backdate.get_active_date(tg_user_id)
     try:
         await tx.save_transaction(user_id, who, amount, tx_type, category, source, comment,
                                   quantity=quantity, unit=unit, override_datetime=backdate_dt)
@@ -138,6 +145,7 @@ async def save_and_confirm(message: Message, user_id: int, who: str, amount: flo
 async def finalize_auto_expense(message: Message, user_id: int, who: str, amount: float,
                                 tx_type: str, car_name: str, auto_type: str,
                                 description: str, mileage: float | None, source: str,
+                                tg_user_id: int,
                                 quantity: float | None = None, unit: str | None = None):
     # Автосоздание категории, если её ещё нет в таблице — тот же паттерн,
     # что уже есть в new_category_named для вручную введённого имени.
@@ -153,7 +161,9 @@ async def finalize_auto_expense(message: Message, user_id: int, who: str, amount
     except Exception:
         logging.exception("finalize_auto_expense: failed to auto-create category %s", auto_type)
 
-    backdate_dt = await backdate.get_active_date(user_id)
+    # tg_user_id — см. docstring save_and_confirm выше, тот же самый баг
+    # был и здесь (backdate по внутреннему id вместо Telegram ID).
+    backdate_dt = await backdate.get_active_date(tg_user_id)
     try:
         await tx.save_auto_expense(user_id, who, amount, tx_type, car_name, auto_type,
                                    description, mileage, source, quantity=quantity, unit=unit,
@@ -187,6 +197,7 @@ async def ask_car_disambiguation(message: Message, state: FSMContext, active_car
 
 async def route_auto_expense(message: Message, state: FSMContext, user_id: int, who: str,
                              amount: float, tx_type: str, source: str, remainder: str,
+                             tg_user_id: int,
                              quantity: float | None = None, unit: str | None = None,
                              preferred_type: str | None = None, item_text: str | None = None):
     """preferred_type — если человек ЯВНО выбрал одну из авто-категорий сам
@@ -224,7 +235,7 @@ async def route_auto_expense(message: Message, state: FSMContext, user_id: int, 
     if matched_name:
         description = cars.clean_description(base_description, matched_name)
         await finalize_auto_expense(message, user_id, who, amount, tx_type, matched_name,
-                                    auto_type, description, mileage, source, quantity, unit)
+                                    auto_type, description, mileage, source, tg_user_id, quantity, unit)
         await state.clear()
         return
 
@@ -232,7 +243,7 @@ async def route_auto_expense(message: Message, state: FSMContext, user_id: int, 
         only_car = active_cars[0]["Машина"]
         description = cars.clean_description(base_description, only_car)
         await finalize_auto_expense(message, user_id, who, amount, tx_type, only_car,
-                                    auto_type, description, mileage, source, quantity, unit)
+                                    auto_type, description, mileage, source, tg_user_id, quantity, unit)
         await state.clear()
         return
 
@@ -428,7 +439,7 @@ async def resolve_pending_intent(message: Message, state: FSMContext, user_id: i
         await finalize_auto_expense(
             message, user_id, who, payload["amount"], payload["tx_type"], car_name,
             payload["auto_type"], description, payload["mileage"], payload["source"],
-            payload.get("quantity"), payload.get("unit"),
+            from_user.id, payload.get("quantity"), payload.get("unit"),
         )
     elif intent == "mileage_update":
         await save_mileage_and_confirm(message, user_id, who, car_name, payload["mileage"])
@@ -500,13 +511,15 @@ async def new_category_named(message: Message, state: FSMContext):
     if name in AUTO_CATEGORIES:
         await route_auto_expense(
             message, state, user["id"], who,
-            data["amount"], data["tx_type"], data["source"], remainder, quantity, unit,
+            data["amount"], data["tx_type"], data["source"], remainder,
+            tg_user_id=message.from_user.id, quantity=quantity, unit=unit,
             preferred_type=name, item_text=item_text,
         )
         return
 
     await save_and_confirm(message, user["id"], who, data["amount"], data["tx_type"],
-                           name, data["source"], comment=remainder, quantity=quantity, unit=unit)
+                           name, data["source"], tg_user_id=message.from_user.id,
+                           comment=remainder, quantity=quantity, unit=unit)
     keyword = first_keyword(item_text)
     if keyword:
         db.remember_keyword_category(user["id"], keyword, name)
@@ -527,7 +540,8 @@ async def category_chosen(callback: CallbackQuery, state: FSMContext):
     if category in AUTO_CATEGORIES:
         await route_auto_expense(
             callback.message, state, user["id"], who,
-            data["amount"], data["tx_type"], data["source"], remainder, quantity, unit,
+            data["amount"], data["tx_type"], data["source"], remainder,
+            tg_user_id=callback.from_user.id, quantity=quantity, unit=unit,
             preferred_type=category, item_text=item_text,
         )
         # route_auto_expense сам решает, чистить ли state (может понадобиться
@@ -536,7 +550,8 @@ async def category_chosen(callback: CallbackQuery, state: FSMContext):
         return
 
     await save_and_confirm(callback.message, user["id"], who, data["amount"], data["tx_type"],
-                           category, data["source"], comment=remainder, quantity=quantity, unit=unit)
+                           category, data["source"], tg_user_id=callback.from_user.id,
+                           comment=remainder, quantity=quantity, unit=unit)
     keyword = first_keyword(item_text)
     if keyword:
         db.remember_keyword_category(user["id"], keyword, category)
@@ -596,11 +611,12 @@ async def process_text_input(message: Message, state: FSMContext, text: str, sou
 
     if category in AUTO_CATEGORIES:
         await route_auto_expense(message, state, user["id"], who, amount, tx_type, source, remainder,
-                                 quantity, unit, item_text=item_text)
+                                 tg_user_id=message.from_user.id, quantity=quantity, unit=unit,
+                                 item_text=item_text)
         return
 
     await save_and_confirm(message, user["id"], who, amount, tx_type, category, source,
-                           comment=remainder, quantity=quantity, unit=unit)
+                           tg_user_id=message.from_user.id, comment=remainder, quantity=quantity, unit=unit)
 
 
 @router.message(F.voice)
