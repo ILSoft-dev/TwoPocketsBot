@@ -14,6 +14,13 @@ os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_KEY", "dummy")
 os.environ.setdefault("BOT_TOKEN", "123:dummy")
 os.environ.setdefault("GROQ_API_KEY", "dummy")
+# cars.py -> sheets_client.py -> sheets_cache.py конструирует Redis-клиент
+# уже на этапе импорта (redis.from_url() валидирует схему URL сразу, даже
+# не подключаясь) — с v1.x config.py REDIS_URL больше не подставляет
+# localhost сам (см. config.py changelog, "не смотреть на localhost на
+# Render"), так что без этой строки импорт cars.py падает ещё до первого
+# теста, хотя ни один тест реально в Redis не стучится.
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 
 from config import forced_category, looks_like_question
 import auto_expense
@@ -31,6 +38,7 @@ from tx_logic import (
     parse_user_amount,
     filter_by_who,
     sort_by_date_desc,
+    decide_family_invite,
     compute_period_notes,
     note_category_shape,
     note_hidden_visits,
@@ -155,6 +163,25 @@ def test_duplicate_window():
     assert find_recent_duplicate(rows, "ann", 40, "бензин", now=now, window_seconds=10) is None
 
 
+def test_duplicate_window_with_backdate():
+    """save_transaction передаёт сюда override_datetime (backdate-режим)
+    как `now` — дедуп смотрит на разницу между НИМ и датой уже
+    существующей строки, а не на реальное текущее время. Повторная
+    отправка той же backdate-траты (двойной тап, повтор апдейта) должна
+    схлопнуться, а другая историческая дата — не считаться дублем, даже
+    если оба сообщения реально отправлены только что."""
+    backdated_now = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)
+    rows = [{
+        "Статус": STATUS_ACTIVE, "Кто": "ann", "Сумма": 100,
+        "Комментарий": "кофе", "Дата и время": backdated_now.isoformat(),
+        "ID": "r1",
+    }]
+    assert find_recent_duplicate(rows, "ann", 100, "кофе", now=backdated_now) is not None
+
+    different_backdated_now = datetime(2026, 1, 10, 9, 0, tzinfo=timezone.utc)
+    assert find_recent_duplicate(rows, "ann", 100, "кофе", now=different_backdated_now) is None
+
+
 def test_parse_user_date():
     from datetime import date
     today = date(2026, 9, 9)
@@ -191,6 +218,29 @@ def test_filter_by_who_and_sort():
     own = filter_by_who(rows, "ilya")
     assert [r["ID"] for r in own] == ["a", "c"]
     assert [r["ID"] for r in sort_by_date_desc(own)] == ["c", "a"]
+
+
+def test_family_shared_sheet_but_own_rows_only():
+    """В общей семейной таблице (общий Google-аккаунт — оба пишут в один
+    и тот же лист) /undo и /edit должны видеть только СВОИ строки, не
+    партнёра — та же filter_by_who, что использует get_own_transactions
+    (sheets_transactions.py)."""
+    shared_sheet_rows = [
+        {"ID": "a", "Кто": "ilya", "Дата и время": "2026-08-01T10:00:00+00:00", "Сумма": 100},
+        {"ID": "b", "Кто": "anna", "Дата и время": "2026-08-02T10:00:00+00:00", "Сумма": 200},
+        {"ID": "c", "Кто": "ilya", "Дата и время": "2026-08-03T10:00:00+00:00", "Сумма": 300},
+    ]
+    ilya_rows = sort_by_date_desc(filter_by_who(shared_sheet_rows, "ilya"))
+    assert [r["ID"] for r in ilya_rows] == ["c", "a"]
+    assert all(r["Кто"] == "ilya" for r in ilya_rows)  # ни одной строки Анны
+
+
+def test_family_invite_decision():
+    assert decide_family_invite(None, None) == "ok"  # оба свободны
+    assert decide_family_invite(5, 5) == "same_family"  # уже вместе
+    assert decide_family_invite(5, None) == "inviter_in_family"  # сам уже в другой семье
+    assert decide_family_invite(5, 7) == "inviter_in_family"  # тем более если семьи разные
+    assert decide_family_invite(None, 9) == "target_in_family"  # цель уже занята
 
 
 def _tx(dt, cat, amount, tx_type="expense", who="ilya"):
@@ -261,9 +311,12 @@ if __name__ == "__main__":
     test_soft_undo()
     test_cash_on_hand()
     test_duplicate_window()
+    test_duplicate_window_with_backdate()
     test_parse_user_date()
     test_parse_user_amount()
     test_filter_by_who_and_sort()
+    test_family_shared_sheet_but_own_rows_only()
+    test_family_invite_decision()
     test_period_notes_category_shape()
     test_period_notes_hidden_visits_vs_batch_session()
     test_period_notes_big_purchases_share()

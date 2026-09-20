@@ -4,11 +4,20 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.fsm.storage.redis import RedisStorage
+from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
 from aiogram.types import BotCommand
 from aiohttp import web
 
-from config import BOT_TOKEN, REDIS_URL, PORT, CRON_SECRET, SUPABASE_KEEPALIVE_INTERVAL_SECONDS, redis_connection_kwargs
+from config import (
+    BOT_TOKEN, REDIS_URL, REDIS_KEY_PREFIX, PORT, CRON_SECRET,
+    SUPABASE_KEEPALIVE_INTERVAL_SECONDS, redis_connection_kwargs, require_env,
+)
+
+# До остальных импортов: google_oauth_web / sheets_cache / insights создают
+# Redis/Supabase-клиенты уже на import. Если звать require_env() только
+# внутри main(), процесс успеет упасть чужой ошибкой раньше явной проверки.
+require_env()
+
 from google_oauth_web import oauth_callback
 import supabase_client as db
 import sheets_transactions as tx
@@ -68,8 +77,10 @@ async def daily_cron(request: web.Request) -> web.Response:
     1 января, иначе сразу возвращает 0) — и структурные заметки за
     закрытый период (тот же принцип "сам решает, что сегодня закрытие").
     Один пинг UptimeRobot закрывает всё сразу."""
-    if CRON_SECRET and request.query.get("secret") != CRON_SECRET:
+    if not _cron_secret_matches(request):
+        logger.info("cron=forbidden")
         return web.Response(status=403, text="forbidden")
+    logger.info("cron=ok")
     bot = request.app["bot"]
     reminders_sent = await reminders.run_reminder_sweep(bot)
     stats_sent = await car_stats.run_monthly_stats_sweep(bot)
@@ -83,6 +94,20 @@ async def daily_cron(request: web.Request) -> web.Response:
             f"notes_sent={notes_sent}"
         )
     )
+
+
+
+def _cron_secret_matches(request: web.Request) -> bool:
+    """Секрет: ?secret= (UptimeRobot), заголовок X-Cron-Secret или
+    Authorization: Bearer. require_env() не даёт стартовать без CRON_SECRET."""
+    provided = request.query.get("secret")
+    if not provided:
+        provided = request.headers.get("X-Cron-Secret")
+    if not provided:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            provided = auth[len("Bearer "):]
+    return provided == CRON_SECRET
 
 
 async def run_health_server(bot: Bot, storage):
@@ -130,7 +155,11 @@ async def run_polling_with_retry(dp: Dispatcher, bot: Bot):
 
 async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    storage = RedisStorage.from_url(REDIS_URL, connection_kwargs=redis_connection_kwargs())
+    storage = RedisStorage.from_url(
+        REDIS_URL,
+        connection_kwargs=redis_connection_kwargs(),
+        key_builder=DefaultKeyBuilder(prefix=REDIS_KEY_PREFIX),
+    )
     dp = Dispatcher(storage=storage)
 
     dp.message.middleware(backdate.SessionMiddleware())  # см. backdate.py — до ЛЮБОГО хендлера

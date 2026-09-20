@@ -1,8 +1,22 @@
+"""
+family.py
+v1.1 - /family @username (объединить бюджет), /family leave (выйти)
+
+Changelog:
+- v1.1: /family @username теперь отдельно отказывает, если приглашающий
+        уже в ДРУГОЙ семье, или если ЦЕЛЬ уже состоит в чужой семье — не
+        только если оба уже вместе (см. tx_logic.decide_family_invite).
+        Раньше второй случай не проверялся вообще: принятие такого
+        приглашения молча добавляло пользователя ВТОРЫМ членом двух разных
+        семей одновременно, и какая из них считалась "эффективным"
+        Google-аккаунтом становилось произвольным (порядок строк в БД).
+"""
 from aiogram import Router, F
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, CallbackQuery
 
 import supabase_client as db
+from tx_logic import decide_family_invite
 from keyboards import family_invite_keyboard, family_leave_confirm_keyboard
 
 router = Router()
@@ -45,8 +59,23 @@ async def cmd_family(message: Message, command: CommandObject):
         )
         return
 
-    if db.get_family_id(user["id"]) and db.get_family_id(user["id"]) == db.get_family_id(target_user["id"]):
+    decision = decide_family_invite(
+        db.get_family_id(user["id"]), db.get_family_id(target_user["id"]),
+    )
+    if decision == "same_family":
         await message.answer("Вы уже в одном семейном бюджете.")
+        return
+    if decision == "inviter_in_family":
+        await message.answer(
+            "Ты уже в семейном бюджете с кем-то другим — сначала выйди из "
+            "него (<code>/family leave</code>), потом приглашай."
+        )
+        return
+    if decision == "target_in_family":
+        await message.answer(
+            f"@{target_username} уже состоит в другом семейном бюджете — "
+            f"пригласить не получится."
+        )
         return
 
     invite = db.create_family_invite(user["id"], target_user["tg_id"])

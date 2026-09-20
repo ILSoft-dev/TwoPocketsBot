@@ -98,7 +98,17 @@ async def exchange_code(state: str, code: str) -> tuple[dict, str, str]:
 
 
 async def refresh_access_token(refresh_token: str) -> dict:
-    """Return {access_token, refresh_token} using a stored refresh token."""
+    """Return {access_token, refresh_token} using a stored refresh token.
+
+    Поднимает sc.GoogleAuthError (не ValueError, как раньше), если сам
+    refresh_token невалиден/отозван (Google вернул 400 invalid_grant и
+    т.п.) — это семантически ТОТ ЖЕ вид проблемы, что и 401 на самом
+    вызове Sheets API (GoogleAuthError), только на шаге до него: и то, и
+    другое значит "нужно заново подключить Google", а не "временный сбой".
+    google_api.TokenBox.refresh() эту функцию не оборачивает в try/except,
+    так что до вызывающего кода (input_handler.py) долетает именно этот
+    тип — по нему различаются сообщения "переподключи Google" и "попробуй
+    ещё раз позже" (см. input_handler._reply_google_error)."""
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -109,7 +119,7 @@ async def refresh_access_token(refresh_token: str) -> dict:
         async with session.post(TOKEN_URL, data=data) as resp:
             payload = await resp.json()
             if resp.status != 200 or "access_token" not in payload:
-                raise ValueError(f"Token refresh failed: {payload}")
+                raise sc.GoogleAuthError(f"Token refresh failed: {payload}")
     return {
         "access_token": payload["access_token"],
         # Google normally does NOT return a new refresh_token on refresh —

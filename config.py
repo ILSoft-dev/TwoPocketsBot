@@ -8,8 +8,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# Без дефолта: раньше "redis://localhost:6379/0" молча подставлялся и на
+# Render, если переменную забыли задать — бот "жил", но FSM/кэш тихо били
+# в несуществующий локальный Redis. Отсутствие REDIS_URL ловит require_env()
+# при старте, до создания Bot/Redis/aiohttp.
+REDIS_URL = os.getenv("REDIS_URL")
 PORT = int(os.getenv("PORT", "8080"))
+
+# Ключи FSM в общем Redis получают префикс, чтобы второй сервис на том же
+# инстансе не тёр состояния этого бота. Остальные ключи (oauth_state:,
+# sheets_cache:, last_question:) и так достаточно специфичные.
+REDIS_KEY_PREFIX = "twopockets"
 
 # Короткий кэш чтения листов Google Sheets (Redis). Сбрасывается при любой
 # записи в тот же лист. 0 — выключить кэш (поведение как без него).
@@ -186,3 +195,27 @@ def redis_connection_kwargs() -> dict:
         "retry_on_error": [RedisConnectionError, RedisTimeoutError],
         "retry": Retry(ExponentialBackoff(base=0.5, cap=2.0), retries=3),
     }
+
+REQUIRED_ENV_VARS = [
+    "BOT_TOKEN",
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "GROQ_API_KEY",
+    "GOOGLE_CLIENT_ID",
+    "GOOGLE_CLIENT_SECRET",
+    "GOOGLE_OAUTH_REDIRECT_URI",
+    "CRON_SECRET",
+    "REDIS_URL",
+]
+
+
+def require_env() -> None:
+    """Проверка обязательных переменных. Вызывать в main.py до тяжёлых
+    импортов: иначе процесс успеет упасть на клиенте Redis/Supabase
+    с чужой трассировкой раньше нашей явной ошибки."""
+    missing = [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]
+    if missing:
+        raise RuntimeError(
+            "Не заданы обязательные переменные окружения: " + ", ".join(missing)
+        )
+

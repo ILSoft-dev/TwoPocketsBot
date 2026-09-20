@@ -1,8 +1,17 @@
 """
 input_handler.py
-v2.1 - text/voice/photo expense input, now backed by Google Sheets
+v2.2 - text/voice/photo expense input, now backed by Google Sheets
 
 Changelog:
+- v2.2: _reply_google_error() различает GoogleAuthError ("нужно заново
+        подключить Google — /start") от всего остального ("временный сбой,
+        попробуй позже"). Раньше оба случая получали один и тот же текст
+        "переподключи через /start" — для обычного временного сбоя Sheets
+        (Google на секунду недоступен, 503 и т.п.) это был лишний и
+        пугающий совет: реконнект Google не нужен и не поможет, если
+        проблема вообще не в токене. GoogleAuthError теперь долетает и с
+        шага обновления токена (google_oauth.refresh_access_token), не
+        только с самого вызова Sheets API — см. её докстринг.
 - v2.1: parser.extract_quantity() plugged in right after parse_amount —
         quantity/unit threaded through ask_category_choice's FSM state,
         save_and_confirm and the Авто-expense route (route_auto_expense /
@@ -37,6 +46,7 @@ import auto_expense
 import fluid_tracker
 import insights
 import backdate
+from sheets_client import GoogleAuthError
 from parser import parse_amount, guess_type, extract_quantity
 from config import forced_category, looks_like_question
 from keyboards import category_choice_keyboard, car_choice_keyboard
@@ -72,6 +82,26 @@ async def react_ok(message: Message):
     except Exception:
         # Реакции могут быть недоступны в некоторых чатах — не критично
         await message.answer("✅ Записано")
+
+
+async def _reply_google_error(message: Message, exc: Exception) -> None:
+    """Единый текст ошибки для сбоев работы с Google Диском — отличает
+    GoogleAuthError ("нужно заново подключить Google" — refresh_token
+    отозван/невалиден, или сам Sheets API стабильно отдаёт 401) от всего
+    остального (сетевой сбой, Google на секунду недоступен — временное,
+    повтор скорее всего поможет). Раньше оба случая получали один и тот же
+    текст "переподключи через /start", что для временного сбоя — лишний и
+    пугающий совет: реконнект Google не нужен и не решит проблему, если
+    дело не в токене."""
+    if isinstance(exc, GoogleAuthError):
+        await message.answer(
+            "Доступ к Google Диску истёк — нужно заново подключить его. Зайди в /start."
+        )
+    else:
+        await message.answer(
+            "Не получилось обратиться к Google Диску (похоже, временный сбой). "
+            "Попробуй ещё раз через минуту."
+        )
 
 
 def first_keyword(remainder: str) -> str:
@@ -125,12 +155,9 @@ async def save_and_confirm(message: Message, user_id: int, who: str, amount: flo
     except tx.NoGoogleAccount:
         await message.answer("Google Drive не подключён — пройди заново /start, чтобы подключить.")
         return
-    except Exception:
+    except Exception as e:
         logging.exception("save_and_confirm: unexpected error writing to Sheets")
-        await message.answer(
-            "Не получилось сохранить в Google Диск. Если повторится — "
-            "переподключи через /start."
-        )
+        await _reply_google_error(message, e)
         return
     if backdate_dt:
         # Явный текст с датой на КАЖДОЕ подтверждение, не тихая реакция —
@@ -171,12 +198,9 @@ async def finalize_auto_expense(message: Message, user_id: int, who: str, amount
     except tx.NoGoogleAccount:
         await message.answer("Google Drive не подключён — пройди заново /start, чтобы подключить.")
         return
-    except Exception:
+    except Exception as e:
         logging.exception("finalize_auto_expense: unexpected error writing to Sheets")
-        await message.answer(
-            "Не получилось сохранить в Google Диск. Если повторится — "
-            "переподключи через /start."
-        )
+        await _reply_google_error(message, e)
         return
     if backdate_dt:
         await message.answer(f"✅ Записано на {backdate_dt.strftime('%d.%m.%Y')}")
@@ -219,12 +243,9 @@ async def route_auto_expense(message: Message, state: FSMContext, user_id: int, 
     account = db.get_effective_google_account(user_id)
     try:
         active_cars = await cars.list_active_cars(account) if account else []
-    except Exception:
+    except Exception as e:
         logging.exception("route_auto_expense: unexpected error listing cars")
-        await message.answer(
-            "Не получилось обратиться к Google Диску. Если повторится — "
-            "переподключи через /start."
-        )
+        await _reply_google_error(message, e)
         return
 
     base_description = item_text if item_text is not None else remainder
@@ -269,12 +290,9 @@ async def handle_mileage_message(message: Message, state: FSMContext, user_id: i
     account = db.get_effective_google_account(user_id)
     try:
         active_cars = await cars.list_active_cars(account) if account else []
-    except Exception:
+    except Exception as e:
         logging.exception("handle_mileage_message: unexpected error listing cars")
-        await message.answer(
-            "Не получилось обратиться к Google Диску. Если повторится — "
-            "переподключи через /start."
-        )
+        await _reply_google_error(message, e)
         return
     matched_name = cars.match_car_name(leftover, active_cars)
 
@@ -316,12 +334,9 @@ async def save_mileage_and_confirm(message: Message, user_id: int, who: str,
     except tx.NoGoogleAccount:
         await message.answer("Google Drive не подключён — пройди заново /start, чтобы подключить.")
         return
-    except Exception:
+    except Exception as e:
         logging.exception("save_mileage_and_confirm: unexpected error writing to Sheets")
-        await message.answer(
-            "Не получилось сохранить в Google Диск. Если повторится — "
-            "переподключи через /start."
-        )
+        await _reply_google_error(message, e)
         return
     await message.answer(f"Записал пробег «{car_name}»: {mileage:g} км")
     await maybe_warn_fluids(message, user_id, car_name, mileage)
@@ -359,12 +374,9 @@ async def mileage_unchanged(callback: CallbackQuery):
             return
 
         await tx.save_mileage_point(user["id"], who, car_row["Машина"], last_mileage, source="Без изменений")
-    except Exception:
+    except Exception as e:
         logging.exception("mileage_unchanged: unexpected error")
-        await callback.message.answer(
-            "Не получилось обратиться к Google Диску. Если повторится — "
-            "переподключи через /start."
-        )
+        await _reply_google_error(callback.message, e)
         await callback.answer()
         return
 
@@ -381,12 +393,9 @@ async def car_choice_picked(callback: CallbackQuery, state: FSMContext):
     account = db.get_effective_google_account(user["id"])
     try:
         active_cars = await cars.list_active_cars(account) if account else []
-    except Exception:
+    except Exception as e:
         logging.exception("car_choice_picked: unexpected error listing cars")
-        await callback.message.answer(
-            "Не получилось обратиться к Google Диску. Если повторится — "
-            "переподключи через /start."
-        )
+        await _reply_google_error(callback.message, e)
         await callback.answer()
         return
     car_row = next((c for c in active_cars if c["ID"] == car_id), None)
@@ -416,12 +425,9 @@ async def new_car_named(message: Message, state: FSMContext):
     if account:
         try:
             await cars.add_car(account, name, who=who)
-        except Exception:
+        except Exception as e:
             logging.exception("new_car_named: unexpected error adding car")
-            await message.answer(
-                "Не получилось сохранить машину в Google Диск. Если "
-                "повторится — переподключи через /start."
-            )
+            await _reply_google_error(message, e)
             return
 
     await resolve_pending_intent(message, state, user["id"], message.from_user, name)

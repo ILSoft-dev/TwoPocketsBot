@@ -186,6 +186,30 @@ def sort_by_date_desc(rows: list[dict], date_key: str = "Дата и время"
     return sorted(rows, key=lambda r: str(r.get(date_key) or ""), reverse=True)
 
 
+def decide_family_invite(inviter_family_id: int | None, target_family_id: int | None) -> str:
+    """Правило для /family @username (family.py) — вынесено в чистую
+    функцию, чтобы тестировалось без aiogram/Supabase (см. tests_logic.py).
+
+    Раньше единственная проверка была "оба уже в ОДНОЙ семье" — ничего не
+    мешало пригласить (и ПРИНЯТЬ) кого-то, если своя семья уже другая, или
+    если ЦЕЛЬ уже состоит в чужой семье. Второй случай — не только про
+    "лишний" инвайт: accept_family_invite молча вставил бы ВТОРУЮ строку
+    family_members для того же user_id, и get_family_id() потом возвращал
+    бы ПРОИЗВОЛЬНУЮ из двух семей (зависит от порядка строк в БД) — а с ней
+    и чужой эффективный Google-аккаунт (см. get_effective_google_account).
+
+    Возвращает: "ok" — можно приглашать; "same_family" — уже вместе;
+    "inviter_in_family" — сам уже в другой семье (сначала /family leave);
+    "target_in_family" — цель уже состоит в чужой семье."""
+    if inviter_family_id is not None and inviter_family_id == target_family_id:
+        return "same_family"
+    if inviter_family_id is not None:
+        return "inviter_in_family"
+    if target_family_id is not None:
+        return "target_in_family"
+    return "ok"
+
+
 def parse_user_date(text: str, today=None, max_days_back: int = 730):
     """Общий парсер дат из пользовательского ввода — ДД.ММ или ДД.ММ.ГГ(ГГ).
     Используется и /backdate, и /edit (см. backdate.py, edit.py), чтобы не

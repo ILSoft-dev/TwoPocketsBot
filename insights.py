@@ -219,9 +219,18 @@ async def _answer_question_inner(user_id: int, text: str) -> str:
     car_names = [c["Машина"] for c in active_cars]
 
     previous = await _get_previous_question(user_id)
-    parsed = await asyncio.to_thread(
-        groq_client.parse_question, text, categories, car_names, previous
-    )
+    try:
+        parsed = await asyncio.to_thread(
+            groq_client.parse_question, text, categories, car_names, previous
+        )
+    except groq_client.GroqUnavailable:
+        # Отдельно от "не понял вопрос" ниже: здесь Groq вообще не ответил
+        # (сеть/лимиты/сбой сервиса) — дело не в формулировке вопроса, так
+        # что просить переформулировать было бы нечестно.
+        return (
+            "Сейчас не могу разобрать вопрос — сервис Groq недоступен. "
+            "Запиши трату или открой /report — это считается без него."
+        )
     if parsed is None:
         return (
             "Не понял вопрос 🤔 Попробуй переформулировать, например: "

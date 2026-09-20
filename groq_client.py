@@ -10,6 +10,22 @@
 - extract_receipt_total — Vision (qwen3.6-27b), фото чека -> сумма
 
 Changelog:
+- v1.10: Единая точка логирования сбоев Groq (_log_groq_failure) — отдельно
+        ловит HTTP 404 ("модель снята с продакшена", уже бывало с
+        llama-4-scout, см. TEXT_MODEL/VISION_MODEL/WHISPER_MODEL выше) и
+        пишет ОДНУ понятную строку в лог с именем модели и подсказкой
+        поменять GROQ_*_MODEL, а не только трассировку стека, где это не
+        сразу видно. Раньше все сбои (сеть/лимиты/деprecation) выглядели в
+        логе одинаково — приходилось разбирать traceback, чтобы понять,
+        что дело именно в снятой модели. Пользователю сырой traceback и
+        раньше не показывался (решает вызывающий код) — это не изменилось.
+        parse_question также получил GroqUnavailable — отдельное исключение
+        для "запрос к Groq не выполнился вообще" (сеть/лимиты/сбой сервиса),
+        в отличие от "запрос выполнился, но ответ не разобрать" (что
+        по-прежнему возвращает None) — вызывающий код (insights.py) должен
+        по-разному это объяснять пользователю: во втором случае разумно
+        попросить переформулировать вопрос, в первом — нет смысла, дело не
+        в формулировке.
 - v1.9: parse_question принимает previous (разбор вопроса, заданного этим
         же пользователем < 10 мин назад) — уточняющие вопросы без повтора
         темы ("Сколько на сахар в июле?" -> "А в августе?"). См. insights.py
@@ -85,19 +101,50 @@ VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3")
 
 
+class GroqUnavailable(Exception):
+    """Запрос к Groq не выполнился ВООБЩЕ (сеть, лимиты, сбой сервиса) — в
+    отличие от "запрос выполнился, но ответ модели не разобрать" (тот
+    случай функции здесь возвращают None, а не поднимают это исключение).
+    Разница важна вызывающему коду: на GroqUnavailable нет смысла просить
+    пользователя переформулировать вопрос/трату — дело не в формулировке."""
+
+
+def _log_groq_failure(context: str, model: str, exc: Exception) -> None:
+    """Единая точка логирования сбоев вызовов Groq. HTTP 404 почти всегда
+    значит "модель снята с продакшена" (уже бывало — см. комментарий про
+    llama-4-scout выше) — для него отдельная понятная строка с именем
+    модели и подсказкой поменять GROQ_*_MODEL, а не только трассировка
+    стека, в которой это не сразу очевидно. Пользователю в любом случае
+    сырой traceback никогда не показываем — сообщение решает вызывающий
+    код, это только для логов."""
+    status = getattr(exc, "status_code", None)
+    if status == 404:
+        logging.error(
+            f"{context}: модель Groq недоступна (404, model={model!r}) — похоже, "
+            f"снята с продакшена. Поменяй GROQ_TEXT_MODEL/GROQ_VISION_MODEL/"
+            f"GROQ_WHISPER_MODEL в переменных окружения."
+        )
+    else:
+        logging.exception(f"{context}: Groq request failed")
+
+
 def categorize_text(remainder_text: str, categories: list[str]) -> str:
     prompt = (
         f"Определи наиболее подходящую категорию из списка: {', '.join(categories)}.\n"
         f"Текст траты/дохода: \"{remainder_text}\"\n"
         f"Ответь ТОЛЬКО названием категории из списка, без пояснений."
     )
-    completion = client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=200,          # запас для reasoning-модели (gpt-oss)
-        reasoning_effort="low",  # не нужны развёрнутые рассуждения на классификацию в одно слово
-    )
+    try:
+        completion = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=200,          # запас для reasoning-модели (gpt-oss)
+            reasoning_effort="low",  # не нужны развёрнутые рассуждения на классификацию в одно слово
+        )
+    except Exception as e:
+        _log_groq_failure("categorize_text", TEXT_MODEL, e)
+        raise
     answer = (completion.choices[0].message.content or "").strip()
     logging.info(f"categorize_text: remainder={remainder_text!r} raw_answer={answer!r}")
 
@@ -117,26 +164,30 @@ def narrate_period_comparison(data_summary: str) -> str:
     явного запрета модель придумывала иллюстративные примеры от себя,
     которые не соответствовали реальным данным пользователя. Здесь запрет
     сразу в промпте, а не патчем после того как кто-то заметит вымысел."""
-    response = client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=[
-            {"role": "system", "content": (
-                "Ты часть бота учёта семейных финансов. Тебе дают уже посчитанные "
-                "числа — доходы/расходы за два периода и заметные изменения по "
-                "категориям. Твоя задача — облечь их в короткий связный текст "
-                "(2-4 предложения, не больше 350 знаков), не список и не заголовки. "
-                "СТРОГО используй только переданные числа. Никогда не досчитывай, "
-                "не округляй по-своему и не придумывай цифры, категории или причины "
-                "изменений, которых нет в данных — если причина неизвестна, не "
-                "гадай о ней. Тон нейтрально-наблюдательный, без нравоучений и без "
-                "советов 'как сэкономить'. Пиши по-русски, обычным языком, не "
-                "канцеляритом."
-            )},
-            {"role": "user", "content": data_summary},
-        ],
-        temperature=0.4,
-        max_tokens=200,
-    )
+    try:
+        response = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "Ты часть бота учёта семейных финансов. Тебе дают уже посчитанные "
+                    "числа — доходы/расходы за два периода и заметные изменения по "
+                    "категориям. Твоя задача — облечь их в короткий связный текст "
+                    "(2-4 предложения, не больше 350 знаков), не список и не заголовки. "
+                    "СТРОГО используй только переданные числа. Никогда не досчитывай, "
+                    "не округляй по-своему и не придумывай цифры, категории или причины "
+                    "изменений, которых нет в данных — если причина неизвестна, не "
+                    "гадай о ней. Тон нейтрально-наблюдательный, без нравоучений и без "
+                    "советов 'как сэкономить'. Пиши по-русски, обычным языком, не "
+                    "канцеляритом."
+                )},
+                {"role": "user", "content": data_summary},
+            ],
+            temperature=0.4,
+            max_tokens=200,
+        )
+    except Exception as e:
+        _log_groq_failure("narrate_period_comparison", TEXT_MODEL, e)
+        raise
     return response.choices[0].message.content.strip()
 
 
@@ -154,41 +205,49 @@ def narrate_period_notes(data_summary: str) -> str:
     с пользователем: "трать меньше на мороженое" — оценочно и рискует
     промахнуться мимо контекста, которого модель не знает; "8 крупных
     покупок = 49% бюджета" — просто факт про структуру)."""
-    response = client.chat.completions.create(
-        model=TEXT_MODEL,
-        messages=[
-            {"role": "system", "content": (
-                "Ты часть бота учёта финансов. Тебе дают уже посчитанные Python'ом "
-                "структурные наблюдения о тратах за один отчётный период — НЕ советы, "
-                "а факты о форме данных (что-то концентрированное или размазанное, "
-                "регулярное, скрытое за отдельными мелкими строками и т.п.). Собери их "
-                "в короткий связный текст (2-4 предложения, не больше 350 знаков), без "
-                "списка и заголовков. СТРОГО используй только переданные наблюдения — "
-                "не досчитывай цифры и не придумывай новых закономерностей сверх того, "
-                "что дано. НИКОГДА не советуй тратить меньше на конкретную категорию, "
-                "не оценивай, была ли покупка нужна, и не предполагай причины трат "
-                "('наверное, из-за стресса' и т.п.) — это заметки о структуре, не оценка "
-                "решений пользователя. Разрешено предложить ОДИН структурный, не "
-                "оценочный вариант действия, только если он явно и без натяжки следует "
-                "из наблюдения (например, про предсказуемые крупные покупки — 'можно "
-                "откладывать под них заранее'), без нажима и без советов по конкретным "
-                "категориям. Тон нейтрально-наблюдательный. Пиши по-русски, обычным "
-                "языком, не канцеляритом."
-            )},
-            {"role": "user", "content": data_summary},
-        ],
-        temperature=0.4,
-        max_tokens=220,
-    )
+    try:
+        response = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[
+                {"role": "system", "content": (
+                    "Ты часть бота учёта финансов. Тебе дают уже посчитанные Python'ом "
+                    "структурные наблюдения о тратах за один отчётный период — НЕ советы, "
+                    "а факты о форме данных (что-то концентрированное или размазанное, "
+                    "регулярное, скрытое за отдельными мелкими строками и т.п.). Собери их "
+                    "в короткий связный текст (2-4 предложения, не больше 350 знаков), без "
+                    "списка и заголовков. СТРОГО используй только переданные наблюдения — "
+                    "не досчитывай цифры и не придумывай новых закономерностей сверх того, "
+                    "что дано. НИКОГДА не советуй тратить меньше на конкретную категорию, "
+                    "не оценивай, была ли покупка нужна, и не предполагай причины трат "
+                    "('наверное, из-за стресса' и т.п.) — это заметки о структуре, не оценка "
+                    "решений пользователя. Разрешено предложить ОДИН структурный, не "
+                    "оценочный вариант действия, только если он явно и без натяжки следует "
+                    "из наблюдения (например, про предсказуемые крупные покупки — 'можно "
+                    "откладывать под них заранее'), без нажима и без советов по конкретным "
+                    "категориям. Тон нейтрально-наблюдательный. Пиши по-русски, обычным "
+                    "языком, не канцеляритом."
+                )},
+                {"role": "user", "content": data_summary},
+            ],
+            temperature=0.4,
+            max_tokens=220,
+        )
+    except Exception as e:
+        _log_groq_failure("narrate_period_notes", TEXT_MODEL, e)
+        raise
     return response.choices[0].message.content.strip()
 
 
 def transcribe_voice(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
-    transcription = client.audio.transcriptions.create(
-        file=(filename, audio_bytes),
-        model=WHISPER_MODEL,
-        language="ru",
-    )
+    try:
+        transcription = client.audio.transcriptions.create(
+            file=(filename, audio_bytes),
+            model=WHISPER_MODEL,
+            language="ru",
+        )
+    except Exception as e:
+        _log_groq_failure("transcribe_voice", WHISPER_MODEL, e)
+        raise
     return transcription.text.strip()
 
 
@@ -258,8 +317,14 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
     подтверждённая проблема с игнорированием json_schema (модель тихо
     возвращает свободный текст), и надёжность даже json_object под вопросом.
     Вместо этого — явная схема прямо в промпте + защитный разбор ответа.
-    Возвращает None при любом сбое (сеть, парсинг) — вызывающий код должен
-    вежливо ответить "не понял вопрос", а не падать.
+
+    Два РАЗНЫХ вида сбоя различаются намеренно:
+    - запрос к Groq не выполнился вообще (сеть, лимиты, сервис недоступен)
+      -> поднимает GroqUnavailable. Дело не в вопросе пользователя, просить
+      переформулировать бессмысленно.
+    - запрос выполнился, но ответ не разобрать (модель ответила не JSON'ом,
+      не смогла понять вопрос и т.п.) -> возвращает None, как раньше.
+      Вызывающий код в этом случае вправе честно попросить переформулировать.
     """
     schema_hint = (
         '{"intent": "spending" | "income" | "mileage" | "last_date" | "quantity" | '
@@ -355,9 +420,13 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
             reasoning_effort="low",
         )
         answer = (completion.choices[0].message.content or "").strip()
-    except Exception:
-        logging.exception("parse_question: Groq request failed")
-        return None
+    except Exception as e:
+        # Запрос не выполнился вообще — GroqUnavailable, а не None: вопрос
+        # не в формулировке пользователя, а в недоступности Groq, и
+        # insights.py должен по-разному объяснить эти два случая (см.
+        # docstring GroqUnavailable выше).
+        _log_groq_failure("parse_question", TEXT_MODEL, e)
+        raise GroqUnavailable() from e
 
     logging.info(f"parse_question: text={text!r} raw_answer={answer!r}")
 
@@ -427,8 +496,8 @@ def cluster_items(comments: list[str]) -> dict[str, str] | None:
             reasoning_effort="low",
         )
         answer = (completion.choices[0].message.content or "").strip()
-    except Exception:
-        logging.exception("cluster_items: Groq request failed")
+    except Exception as e:
+        _log_groq_failure("cluster_items", TEXT_MODEL, e)
         return None
 
     logging.info(f"cluster_items: {len(truncated)} comments, raw_answer={answer[:500]!r}")
@@ -476,23 +545,27 @@ def extract_receipt_total(image_bytes: bytes) -> float | None:
         "Ответь СТРОГО в формате: СУММА: <число без валюты и пробелов>. "
         "Если не удаётся распознать сумму, ответь: СУММА: НЕТ"
     )
-    completion = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
-                    },
-                ],
-            }
-        ],
-        temperature=0,
-        max_tokens=60,
-    )
+    try:
+        completion = client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                        },
+                    ],
+                }
+            ],
+            temperature=0,
+            max_tokens=60,
+        )
+    except Exception as e:
+        _log_groq_failure("extract_receipt_total", VISION_MODEL, e)
+        raise
     answer = (completion.choices[0].message.content or "").strip()
     logging.info(f"extract_receipt_total: raw_answer={answer!r}")
 
