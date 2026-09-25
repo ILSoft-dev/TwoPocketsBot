@@ -349,10 +349,7 @@ async def _answer_quantity(user_id: int, category: str | None, item: str | None,
         return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
 
     expense_rows = [r for r in rows if r["Тип"] == "expense"]
-    if item:
-        matching = [r for r in expense_rows if _item_matches(item, str(r.get("Комментарий", "")))]
-    else:
-        matching = [r for r in expense_rows if r["Категория"] == category]
+    matching = _filter_by_topic(expense_rows, category, item)
 
     if not matching:
         return f"Не нашёл покупок «{keyword}» за {label}."
@@ -403,10 +400,7 @@ async def _answer_count(user_id: int, category: str | None, item: str | None,
         return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
 
     expense_rows = [r for r in rows if r["Тип"] == "expense"]
-    if item:
-        matching = [r for r in expense_rows if _item_matches(item, str(r.get("Комментарий", "")))]
-    else:
-        matching = [r for r in expense_rows if r["Категория"] == category]
+    matching = _filter_by_topic(expense_rows, category, item)
 
     if not matching:
         return f"Не нашёл покупок «{keyword}» за {label}."
@@ -501,10 +495,67 @@ def _item_matches(item: str, text: str) -> bool:
     идея, что уже применяли для распознавания жидкостей в fluid_tracker.py."""
     item_lower = item.lower().strip()
     text_lower = text.lower()
+    if not item_lower:
+        return False
     if item_lower in text_lower:
         return True
     stem_len = max(3, int(len(item_lower) * 0.7))
     return item_lower[:stem_len] in text_lower
+
+
+def _resolve_category(query: str | None, known: list[str]) -> str | None:
+    """LLM часто отрезает составное имя: вопрос «за столовую», в таблице
+    категория «Столовая, кафе». Точное равенство тогда пустое, хотя данные
+    есть. Сначала точное имя без регистра, потом кусок между запятыми,
+    потом та же основа слова, что у товаров в комментарии."""
+    if not query:
+        return None
+    q = query.lower().strip()
+    for name in known:
+        if name.lower().strip() == q:
+            return name
+    hits = [name for name in known if _category_matches(q, name)]
+    if not hits:
+        return None
+    return max(hits, key=len)
+
+
+def _category_matches(query: str, category_name: str) -> bool:
+    name = category_name.lower().strip()
+    if not query or not name:
+        return False
+    if _item_matches(query, name) or _item_matches(name, query):
+        return True
+    for part in name.replace("/", ",").split(","):
+        part = part.strip()
+        if part and (_item_matches(query, part) or _item_matches(part, query)):
+            return True
+    return False
+
+
+def _filter_by_topic(rows: list, category: str | None, item: str | None) -> list:
+    """Товар в комментарии важнее категории. Если категории как точного
+    имени нет — не сдаёмся: ищем слово в имени категории и в комментарии
+    («столовая» → «Столовая, кафе» и «Обед в столовой»)."""
+    if item:
+        return [r for r in rows if _item_matches(item, str(r.get("Комментарий", "")))]
+    if not category:
+        return rows
+    known = []
+    seen: set[str] = set()
+    for r in rows:
+        name = str(r.get("Категория") or "")
+        if name and name not in seen:
+            seen.add(name)
+            known.append(name)
+    resolved = _resolve_category(category, known)
+    if resolved:
+        return [r for r in rows if r.get("Категория") == resolved]
+    return [
+        r for r in rows
+        if _item_matches(category, str(r.get("Комментарий", "")))
+        or _category_matches(category, str(r.get("Категория", "")))
+    ]
 
 
 def _money_subject(category: str | None, item: str | None) -> str:
@@ -535,10 +586,7 @@ async def _compute_money(user_id: int, intent: str, category: str | None, item: 
     # ищем именно его в описании траты, а не суммируем всю угаданную
     # категорию целиком (иначе "сколько на мороженое" отвечало бы суммой
     # по всей категории "Продукты", как это было до фикса).
-    if item:
-        filtered = [r for r in filtered if _item_matches(item, str(r.get("Комментарий", "")))]
-    elif category:
-        filtered = [r for r in filtered if r["Категория"] == category]
+    filtered = _filter_by_topic(filtered, category, item)
 
     total = sum(to_float(r["Сумма"]) for r in filtered)
     return total, len(filtered), None
@@ -629,7 +677,8 @@ async def _answer_breakdown(user_id: int, category: str | None,
     except Exception:
         return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
 
-    matching = [r for r in rows if r["Тип"] == "expense" and r["Категория"] == category]
+    expense_rows = [r for r in rows if r["Тип"] == "expense"]
+    matching = _filter_by_topic(expense_rows, category, None)
     if not matching:
         return f"Нет трат в категории «{category}» за {label}."
 
