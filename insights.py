@@ -493,6 +493,67 @@ def _guess_auto_keyword(text: str) -> str | None:
     return None
 
 
+_REPAIR_QUESTION = ("менял", "меняли", "менялась", "менялись", "замен", "ремонт")
+
+
+def _looks_like_repair_question(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(w in lowered for w in _REPAIR_QUESTION)
+
+
+def _looks_like_repair_row(comment: str, type_or_cat: str) -> bool:
+    blob = f"{comment} {type_or_cat}".lower()
+    return "замен" in blob or "ремонт" in blob
+
+
+def _mentions_car(text: str, car_name: str) -> bool:
+    if not text or not car_name:
+        return False
+    return cars.match_car_name(text, [{"Машина": car_name}]) == car_name
+
+
+def _collect_car_events(car_name: str, keyword: str | None, auto_event: dict | None,
+                        auto_count: int, tx_rows: list, question_text: str) -> list[dict]:
+    """Лист Авто + Транзакции: покупка запчасти и «замена» часто живут
+    в разных листах. «Когда менялись» должно видеть оба и предпочесть замену."""
+    events: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(date_val, text, kind):
+        key = (str(date_val)[:10], (text or "").strip().lower())
+        if not date_val or key in seen:
+            return
+        seen.add(key)
+        events.append({"date": date_val, "text": text or "", "kind": kind or ""})
+
+    if auto_event:
+        add(auto_event.get("Дата"), auto_event.get("Описание"), auto_event.get("Тип"))
+
+    for r in tx_rows or []:
+        comment = str(r.get("Комментарий") or "")
+        cat = str(r.get("Категория") or "")
+        if keyword and not (
+            _item_matches(keyword, comment) or _category_matches(keyword, cat)
+        ):
+            continue
+        if not _mentions_car(comment, car_name) and not _mentions_car(cat, car_name):
+            # авто-категория без имени машины в комментарии — всё равно берём,
+            # если категория уже Топливо/Ремонт/Запчасти и keyword совпал
+            if cat not in (
+                auto_expense.TYPE_FUEL, auto_expense.TYPE_REPAIR,
+                auto_expense.TYPE_PARTS, auto_expense.TYPE_OTHER,
+            ):
+                continue
+        add(r.get("Дата и время"), comment, cat)
+
+    events.sort(key=lambda e: str(e["date"]), reverse=True)
+    if keyword and _looks_like_repair_question(question_text):
+        repairs = [e for e in events if _looks_like_repair_row(e["text"], e["kind"])]
+        if repairs:
+            return repairs
+    return events
+
+
 async def _answer_last_date(user_id: int, account: dict | None, car_name: str | None,
                             category: str | None, item: str | None,
                             question_text: str = "",
@@ -512,24 +573,35 @@ async def _answer_last_date(user_id: int, account: dict | None, car_name: str | 
             event, count = await cars.get_last_auto_event(
                 account, car_name, keyword, since=since, until=until
             )
+            tx_rows = await get_transactions_in_range(user_id, since, until)
+        except NoGoogleAccount:
+            return "Google Drive не подключён — пройди заново /start."
         except Exception:
             return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
-        if event is None:
+
+        events = _collect_car_events(
+            car_name, keyword, event, count, tx_rows, question_text
+        )
+        if not events:
             subject = f" «{keyword}»" if keyword else ""
             return f"Не нашёл записей{subject} по «{car_name}»{when}."
         if keyword:
-            date_part = f"Последний раз {keyword} на «{car_name}»{when}: {_format_date(event['Дата'])}"
-            if count > 1:
-                word = _plural_ru(count, "раз", "раза", "раз")
-                return f"{date_part} (всего {count} {word})."
+            latest = events[0]
+            date_part = (
+                f"Последний раз {keyword} на «{car_name}»{when}: "
+                f"{_format_date(latest['date'])}"
+            )
+            if latest.get("kind"):
+                date_part += f" ({latest['kind']})"
+            if len(events) > 1:
+                word = _plural_ru(len(events), "раз", "раза", "раз")
+                return f"{date_part} (всего {len(events)} {word})."
             return f"{date_part}."
-        # Не разобрал, ЧТО именно спрашивают про машину (item пустой) —
-        # не выдаём это за ответ по существу молча: показываем, что реально
-        # нашли (последнее событие ЛЮБОГО типа), и просим уточнить.
+        latest = events[0]
         return (
             f"Не понял, что именно спрашиваешь про «{car_name}» — вот "
-            f"последняя запись по машине вообще: {event['Тип']} "
-            f"({event['Описание']}), {_format_date(event['Дата'])}. "
+            f"последняя запись по машине вообще: {latest.get('kind') or 'запись'} "
+            f"({latest.get('text') or ''}), {_format_date(latest['date'])}. "
             f"Уточни конкретнее, например «когда меняли масло на {car_name}?»."
         )
 
