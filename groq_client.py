@@ -258,7 +258,7 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
      "category": <строка из categories или null>,
      "item": <конкретный товар/продукт из вопроса, если назван, иначе null>,
      "car_name": <строка из car_names или null>,
-     "period_type": "specific_month"|"current_period"|"all_time",
+     "period_type": "specific_month"|"calendar_month"|"current_period"|"all_time",
      "month": <1-12 или null>, "year": <год или null>,
      "compare_previous": true|false}
 
@@ -332,7 +332,7 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
         '"category": "<строка из известных категорий или null>", '
         '"item": "<конкретный товар/продукт, если назван явно, иначе null>", '
         '"car_name": "<строка из известных машин или null>", '
-        '"period_type": "specific_month" | "current_period" | "all_time", '
+        '"period_type": "specific_month" | "calendar_month" | "current_period" | "all_time", '
         '"month": <число 1-12 или null>, "year": <число или null>, '
         '"compare_previous": true | false}'
     )
@@ -406,8 +406,12 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
         "если слово \"бензин\" в вопросе не произнесено напрямую.\n"
         "- car_name — ТОЛЬКО точное совпадение из списка известных машин, иначе null.\n"
         "- period_type=specific_month, если назван конкретный месяц (год может быть не назван).\n"
+        "- period_type=calendar_month, если говорят \"в этом месяце\" / \"за этот месяц\" "
+        "без имени месяца — это календарный месяц с 1-го числа, НЕ отчётный период "
+        "от дня зарплаты.\n"
         "- period_type=current_period, если период не назван вообще (спрашивают "
-        "\"сколько я потратил\" без уточнения когда).\n"
+        "\"сколько я потратил\" без уточнения когда) — тогда код берёт отчётный "
+        "период пользователя (день зарплаты).\n"
         "- period_type=all_time, если явно просят за всё время/всего/с начала.\n"
         "- month — номер месяца 1-12, если назван (иначе null). year — если назван явно (иначе null)."
     )

@@ -47,7 +47,7 @@ Changelog:
         принципе, каждая подходящая запись = одна покупка.
 - v1.4: _answer_last_date получила _guess_auto_keyword() — детерминированный
         фоллбэк на СЫРОМ тексте вопроса (те же основы, что
-        auto_expense.FUEL_KEYWORDS/REPAIR_KEYWORDS/MAINTENANCE_KEYWORDS
+        auto_expense.FUEL_KEYWORDS/ACTION_KEYWORDS/PARTS_KEYWORDS
         используют при категоризации трат), когда LLM не дала item. В
         проде "когда заправлял опель?"/"когда покупал бензин на опель?"
         оба падали в безключевой фоллбэк — для глагольных формулировок
@@ -83,6 +83,7 @@ from calendar import monthrange
 import asyncio
 import json
 import logging
+import re
 
 import redis.asyncio as redis_asyncio
 
@@ -93,6 +94,7 @@ import groq_client
 from config import REDIS_URL
 from report import period_start
 from sheets_transactions import get_transactions_in_range, to_float, NoGoogleAccount
+from parser import extract_quantity
 
 # Память последнего РАЗОБРАННОГО вопроса пользователя — для уточняющих
 # вопросов без повтора темы ("Сколько на сахар в июле?" -> "А в августе?").
@@ -149,14 +151,55 @@ def month_bounds(year: int, month: int) -> tuple[datetime, datetime]:
     return since, until
 
 
+_CALENDAR_MONTH_MARKERS = (
+    "в этом месяце", "за этот месяц", "этот месяц", "в этом календарном",
+    "за календарный месяц",
+)
+
+
+def _coerce_period_type(text: str, period_type: str, month: int | None) -> str:
+    """«В этом месяце» — календарь 1…конец, не отрезок от дня зарплаты."""
+    lowered = (text or "").lower()
+    if any(m in lowered for m in _CALENDAR_MONTH_MARKERS):
+        return "calendar_month"
+    if period_type == "this_month":
+        return "calendar_month"
+    return period_type or "current_period"
+
+
+def _format_period_label(label: str, since, until) -> str:
+    if not since and not until:
+        return label
+    end = until or datetime.now(timezone.utc)
+    if since is None:
+        return f"{label} (по {_format_short_date(end)})"
+    return f"{label} ({_format_short_date(since)}–{_format_short_date(end)})"
+
+
+def _format_short_date(value) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m")
+    try:
+        return datetime.fromisoformat(str(value)).strftime("%d.%m")
+    except ValueError:
+        return str(value)
+
+
 def resolve_period(period_type: str, month: int | None, year: int | None,
                    month_start_day: int) -> tuple[datetime | None, datetime | None, str]:
     """Возвращает (since, until, human_label). until=None — открытый диапазон
     (до сейчас)."""
-    if period_type == "specific_month" and month:
-        actual_year = resolve_year_for_month(month, year)
-        since, until = month_bounds(actual_year, month)
-        label = f"{MONTH_NAMES.get(month, month)} {actual_year}"
+    if period_type in ("specific_month", "calendar_month", "this_month"):
+        now = datetime.now(timezone.utc)
+        actual_month = month or now.month
+        actual_year = year or (resolve_year_for_month(actual_month, year) if month else now.year)
+        if period_type in ("calendar_month", "this_month") and not month:
+            actual_month, actual_year = now.month, now.year
+        elif month:
+            actual_year = resolve_year_for_month(month, year)
+            actual_month = month
+        since, until = month_bounds(actual_year, actual_month)
+        label = f"{MONTH_NAMES.get(actual_month, actual_month)} {actual_year}"
         return since, until, label
 
     if period_type == "current_period":
@@ -173,10 +216,17 @@ def resolve_previous_period(period_type: str, month: int | None, year: int | Non
     аргументами — для intent'ов с compare_previous. Третий элемент — None,
     если сравнивать не с чем (all_time), вызывающий код должен это
     проверить и не звать _answer_comparison в этом случае."""
-    if period_type == "specific_month" and month:
-        actual_year = resolve_year_for_month(month, year)
-        prev_month = month - 1 or 12
-        prev_year = actual_year if month > 1 else actual_year - 1
+    if period_type in ("specific_month", "calendar_month", "this_month"):
+        now = datetime.now(timezone.utc)
+        actual_month = month or now.month
+        actual_year = year or now.year
+        if month:
+            actual_year = resolve_year_for_month(month, year)
+            actual_month = month
+        elif period_type not in ("calendar_month", "this_month"):
+            return None, None, None
+        prev_month = actual_month - 1 or 12
+        prev_year = actual_year if actual_month > 1 else actual_year - 1
         since, until = month_bounds(prev_year, prev_month)
         label = f"{MONTH_NAMES.get(prev_month, prev_month)} {prev_year}"
         return since, until, label
@@ -251,18 +301,27 @@ async def _answer_question_inner(user_id: int, text: str) -> str:
     # чем не подставлять никакой.
     await _remember_question(user_id, text, parsed)
 
-    # last_date ("когда я в последний раз...") по смыслу не ограничен
-    # отчётным периодом — сознательно НЕ вызывает resolve_period, ищет по
-    # всей истории, даже если LLM всё равно что-то заполнила в period_type.
-    if intent == "last_date":
-        return await _answer_last_date(user_id, account, parsed.get("car_name"),
-                                       parsed.get("category"), parsed.get("item"), text)
+    period_type = _coerce_period_type(text, parsed.get("period_type", "current_period"),
+                                      parsed.get("month"))
 
     since, until, label = resolve_period(
-        parsed.get("period_type", "current_period"),
+        period_type,
         parsed.get("month"), parsed.get("year"),
         user.get("month_start", 1),
     )
+    label = _format_period_label(label, since, until)
+
+    # last_date без названного месяца — вся история. Месяц/«в этом месяце»
+    # названы — уважаем диапазон, а не игнорируем его.
+    if intent == "last_date":
+        use_range = period_type in ("specific_month", "calendar_month", "this_month") or parsed.get("month")
+        return await _answer_last_date(
+            user_id, account, parsed.get("car_name"),
+            parsed.get("category"), parsed.get("item"), text,
+            since=since if use_range else None,
+            until=until if use_range else None,
+            label=label if use_range else None,
+        )
 
     if intent == "mileage":
         return await _answer_mileage(account, parsed.get("car_name"), since, until, label)
@@ -283,10 +342,12 @@ async def _answer_question_inner(user_id: int, text: str) -> str:
     # про количество/среднее "больше, чем в прошлом" не просили, не гадаем.
     if intent in ("spending", "income") and parsed.get("compare_previous"):
         prev_since, prev_until, prev_label = resolve_previous_period(
-            parsed.get("period_type", "current_period"),
+            period_type,
             parsed.get("month"), parsed.get("year"),
             user.get("month_start", 1),
         )
+        if prev_label:
+            prev_label = _format_period_label(prev_label, prev_since, prev_until)
         if prev_label is None:
             return "Не с чем сравнивать — «за всё время» не имеет предыдущего периода. Уточни конкретный месяц или период."
         return await _answer_comparison(user_id, intent, parsed.get("category"), parsed.get("item"),
@@ -354,10 +415,16 @@ async def _answer_quantity(user_id: int, category: str | None, item: str | None,
     if not matching:
         return f"Не нашёл покупок «{keyword}» за {label}."
 
-    with_qty = [r for r in matching if str(r.get("Количество", "")).strip() != ""]
-    without_qty = len(matching) - len(with_qty)
+    parsed_rows: list[tuple[float, str]] = []
+    without_qty = 0
+    for r in matching:
+        qty, unit = _quantity_of_row(r)
+        if qty is None:
+            without_qty += 1
+        else:
+            parsed_rows.append((qty, unit))
 
-    if not with_qty:
+    if not parsed_rows:
         word = _plural_ru(len(matching), "запись", "записи", "записей")
         return (
             f"За {label} нашёл {len(matching)} {word} «{keyword}», но ни в одной "
@@ -366,9 +433,8 @@ async def _answer_quantity(user_id: int, category: str | None, item: str | None,
         )
 
     by_unit: dict[str, float] = {}
-    for r in with_qty:
-        unit = str(r.get("Единица", "")).strip() or "шт"
-        by_unit[unit] = by_unit.get(unit, 0) + to_float(r["Количество"])
+    for qty, unit in parsed_rows:
+        by_unit[unit] = by_unit.get(unit, 0) + qty
 
     parts = [f"{amount:g} {unit}" for unit, amount in by_unit.items()]
     result = f"За {label} «{keyword}»: " + ", ".join(parts) + "."
@@ -420,7 +486,7 @@ def _guess_auto_keyword(text: str) -> str | None:
         return "бензин"
     if " то " in lowered or "техосмотр" in lowered:
         return "ТО"
-    for kw in auto_expense.REPAIR_KEYWORDS + auto_expense.MAINTENANCE_KEYWORDS:
+    for kw in auto_expense.ACTION_KEYWORDS + auto_expense.PARTS_KEYWORDS:
         stripped = kw.strip()
         if stripped and stripped in lowered:
             return stripped
@@ -429,11 +495,13 @@ def _guess_auto_keyword(text: str) -> str | None:
 
 async def _answer_last_date(user_id: int, account: dict | None, car_name: str | None,
                             category: str | None, item: str | None,
-                            question_text: str = "") -> str:
-    """Ищет дату САМОГО ПОСЛЕДНЕГО подходящего события за всю историю.
-    car_name задан -> ищем в листе Авто (масло/ТО/заправка и т.п. по
-    конкретной машине), иначе -> в общих Транзакциях по товару/категории."""
+                            question_text: str = "",
+                            since=None, until=None, label: str | None = None) -> str:
+    """Ищет дату САМОГО ПОСЛЕДНЕГО подходящего события.
+    Месяц не назван — вся история. Назван — только этот диапазон.
+    car_name задан -> лист Авто, иначе общие Транзакции."""
     keyword = item or category
+    when = f" за {label}" if label else ""
 
     if car_name:
         if not account:
@@ -441,14 +509,16 @@ async def _answer_last_date(user_id: int, account: dict | None, car_name: str | 
         if not keyword:
             keyword = _guess_auto_keyword(question_text)
         try:
-            event, count = await cars.get_last_auto_event(account, car_name, keyword)
+            event, count = await cars.get_last_auto_event(
+                account, car_name, keyword, since=since, until=until
+            )
         except Exception:
             return "Не получилось обратиться к Google Диску. Попробуй ещё раз позже."
         if event is None:
             subject = f" «{keyword}»" if keyword else ""
-            return f"Не нашёл записей{subject} по «{car_name}»."
+            return f"Не нашёл записей{subject} по «{car_name}»{when}."
         if keyword:
-            date_part = f"Последний раз {keyword} на «{car_name}»: {_format_date(event['Дата'])}"
+            date_part = f"Последний раз {keyword} на «{car_name}»{when}: {_format_date(event['Дата'])}"
             if count > 1:
                 word = _plural_ru(count, "раз", "раза", "раз")
                 return f"{date_part} (всего {count} {word})."
@@ -467,7 +537,7 @@ async def _answer_last_date(user_id: int, account: dict | None, car_name: str | 
         return "Не понял, про что именно спрашиваешь — назови товар или категорию."
 
     try:
-        rows = await get_transactions_in_range(user_id, None, None)
+        rows = await get_transactions_in_range(user_id, since, until)
     except NoGoogleAccount:
         return "Google Drive не подключён — пройди заново /start."
     except Exception:
@@ -475,32 +545,59 @@ async def _answer_last_date(user_id: int, account: dict | None, car_name: str | 
 
     # Уже отсортированы по дате desc (get_transactions_in_range) — первое
     # совпадение и есть самое последнее.
-    matching = [
-        r for r in rows
-        if _item_matches(keyword, str(r.get("Комментарий", ""))) or r["Категория"] == keyword
-    ]
+    matching = _filter_by_topic(rows, category, item)
     if not matching:
-        return f"Не нашёл трат «{keyword}»."
-    date_part = f"Последний раз «{keyword}»: {_format_date(matching[0]['Дата и время'])}"
+        matching = [
+            r for r in rows
+            if _item_matches(keyword, str(r.get("Комментарий", "")))
+            or _category_matches(keyword, str(r.get("Категория", "")))
+        ]
+    if not matching:
+        return f"Не нашёл трат «{keyword}»{when}."
+    date_part = f"Последний раз «{keyword}»{when}: {_format_date(matching[0]['Дата и время'])}"
     if len(matching) > 1:
         word = _plural_ru(len(matching), "раз", "раза", "раз")
         return f"{date_part} (всего {len(matching)} {word})."
     return f"{date_part}."
 
 
+_WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
+_SHORT_ENDINGS = {
+    "", "а", "я", "у", "ю", "е", "о", "и", "ы", "й",
+    "ой", "ое", "ая", "ые", "ие", "ых", "их", "ам", "ям",
+    "ом", "ем", "ов", "ев", "ах", "ях", "ами", "ями",
+}
+
+
+def _token_matches_word(token: str, word: str) -> bool:
+    """Целое слово или основа с коротким окончанием. «рис» ≠ «рикотты»,
+    «кофе» ≠ «кофейного», «мороженое» = «мороженых», «столовая» = «столовой»."""
+    if word == token:
+        return True
+    if len(token) < 4:
+        return False
+    if word.startswith(token) and word[len(token):] in _SHORT_ENDINGS:
+        return True
+    if len(token) >= 5:
+        stem_len = max(4, int(len(token) * 0.7))
+        stem = token[:stem_len]
+        if word.startswith(stem) and len(word) - len(stem) <= 4:
+            return True
+    return False
+
+
 def _item_matches(item: str, text: str) -> bool:
-    """Подстрочное совпадение с запасом на падежные окончания ("мороженое"
-    в вопросе должно найти "мороженых" в описании траты) — берём основу
-    слова (~70% длины, минимум 3 символа), а не всё слово целиком. Та же
-    идея, что уже применяли для распознавания жидкостей в fluid_tracker.py."""
     item_lower = item.lower().strip()
     text_lower = text.lower()
     if not item_lower:
         return False
-    if item_lower in text_lower:
-        return True
-    stem_len = max(3, int(len(item_lower) * 0.7))
-    return item_lower[:stem_len] in text_lower
+    tokens = _WORD_RE.findall(item_lower)
+    if not tokens:
+        return False
+    words = _WORD_RE.findall(text_lower)
+    if not words:
+        return False
+    return all(any(_token_matches_word(tok, w) for w in words) for tok in tokens)
 
 
 def _resolve_category(query: str | None, known: list[str]) -> str | None:
@@ -556,6 +653,20 @@ def _filter_by_topic(rows: list, category: str | None, item: str | None) -> list
         if _item_matches(category, str(r.get("Комментарий", "")))
         or _category_matches(category, str(r.get("Категория", "")))
     ]
+
+
+def _quantity_of_row(row: dict) -> tuple[float | None, str]:
+    """Сначала колонка Количество, иначе тот же разбор, что при записи,
+    по комментарию («3 мороженых»). Пустой комментарий без цифры — None."""
+    raw = str(row.get("Количество", "")).strip()
+    if raw:
+        unit = str(row.get("Единица", "")).strip() or "шт"
+        return to_float(raw), unit
+    comment = str(row.get("Комментарий", "") or "")
+    qty, unit, _rest = extract_quantity(comment)
+    if qty is None:
+        return None, "шт"
+    return qty, unit or "шт"
 
 
 def _money_subject(category: str | None, item: str | None) -> str:
@@ -621,7 +732,7 @@ async def _answer_average(user_id: int, category: str | None, item: str | None,
 
     avg = total / count
     return (
-        f"За {label}{subject}: в среднем {avg:g} {currency} за покупку "
+        f"За {label}{subject}: в среднем {avg:g} {currency} за запись "
         f"({count} записей, всего {total:g} {currency})."
     )
 

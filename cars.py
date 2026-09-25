@@ -81,6 +81,8 @@ def _alias_group_for(word: str) -> set[str] | None:
             return group
     return None
 
+from datetime import datetime, timezone
+
 import aiohttp
 
 import sheets_client as sc
@@ -228,7 +230,8 @@ def _keyword_matches(keyword: str, text: str) -> bool:
     return kw[:stem_len] in lowered
 
 
-async def get_last_auto_event(account: dict, car_name: str, keyword: str | None) -> tuple[dict | None, int]:
+async def get_last_auto_event(account: dict, car_name: str, keyword: str | None,
+                              since=None, until=None) -> tuple[dict | None, int]:
     """(самая свежая подходящая запись, СКОЛЬКО ВСЕГО подходящих записей).
     keyword None/пустой -> просто последняя запись по машине, любого типа.
     Используется для вопросов "когда" ("когда менял масло на опеле?") —
@@ -258,6 +261,22 @@ async def get_last_auto_event(account: dict, car_name: str, keyword: str | None)
             ]
         else:
             candidates = [r for r in candidates if _keyword_matches(keyword, str(r["Описание"]))]
+    if since or until:
+        filtered = []
+        for r in candidates:
+            raw = str(r.get("Дата") or "")
+            try:
+                dt = datetime.fromisoformat(raw)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if since and dt < since:
+                continue
+            if until and dt > until:
+                continue
+            filtered.append(r)
+        candidates = filtered
     if not candidates:
         return None, 0
     candidates.sort(key=lambda r: str(r["Дата"]), reverse=True)
