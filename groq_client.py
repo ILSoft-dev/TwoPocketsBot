@@ -10,6 +10,13 @@
 - extract_receipt_total — Vision (qwen3.6-27b), фото чека -> сумма
 
 Changelog:
+- v1.11: parse_question получил month_to — вопрос про ДВА месяца сразу
+        ("за август и сентябрь") раньше не мог выразиться в схеме (только
+        один "month"), и код в insights.py тихо откатывался на ТЕКУЩИЙ
+        месяц (month=null -> now.month), без единого намёка, что ответил
+        не на тот вопрос. Подтверждённый баг на проде 1 октября 2026:
+        "какой пробег у матиза за август и сентябрь?" ответил про октябрь.
+        См. insights.resolve_period/resolve_previous_period — там же.
 - v1.10: Единая точка логирования сбоев Groq (_log_groq_failure) — отдельно
         ловит HTTP 404 ("модель снята с продакшена", уже бывало с
         llama-4-scout, см. TEXT_MODEL/VISION_MODEL/WHISPER_MODEL выше) и
@@ -259,8 +266,18 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
      "item": <конкретный товар/продукт из вопроса, если назван, иначе null>,
      "car_name": <строка из car_names или null>,
      "period_type": "specific_month"|"calendar_month"|"current_period"|"all_time",
-     "month": <1-12 или null>, "year": <год или null>,
+     "month": <1-12 или null>, "month_to": <1-12 или null>, "year": <год или null>,
      "compare_previous": true|false}
+
+    month_to — ТОЛЬКО если вопрос называет ДВА месяца вместе одним диапазоном
+    ("за август и сентябрь", "в августе-сентябре", "с июня по август" —
+    тогда month=6, month_to=8, промежуточный июль подразумевается).
+    month = более ранний месяц диапазона, month_to = более поздний. Раньше
+    этого поля не было вообще, и такие вопросы тихо откатывались на текущий
+    календарный месяц (period_type=specific_month, month=null) — реальный
+    баг, подтверждённый на проде 1 октября: "пробег за август и сентябрь"
+    отвечал про октябрь, потому что month=null -> код подставлял now.month.
+    Обычный одномесячный вопрос — month_to всегда null, ничего не меняется.
 
     intent=last_date — вопросы "когда" ("когда я менял масло на опеле?",
     "когда последний раз покупал кофе?"): ищем не сумму, а дату САМОГО
@@ -333,7 +350,8 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
         '"item": "<конкретный товар/продукт, если назван явно, иначе null>", '
         '"car_name": "<строка из известных машин или null>", '
         '"period_type": "specific_month" | "calendar_month" | "current_period" | "all_time", '
-        '"month": <число 1-12 или null>, "year": <число или null>, '
+        '"month": <число 1-12 или null>, "month_to": <число 1-12 или null>, '
+        '"year": <число или null>, '
         '"compare_previous": true | false}'
     )
     known = (
@@ -413,7 +431,12 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
         "\"сколько я потратил\" без уточнения когда) — тогда код берёт отчётный "
         "период пользователя (день зарплаты).\n"
         "- period_type=all_time, если явно просят за всё время/всего/с начала.\n"
-        "- month — номер месяца 1-12, если назван (иначе null). year — если назван явно (иначе null)."
+        "- month — номер месяца 1-12, если назван (иначе null). year — если назван явно (иначе null).\n"
+        "- month_to — ТОЛЬКО если вопрос называет диапазон из двух месяцев вместе "
+        "(\"за август и сентябрь\", \"в августе-сентябре\", \"с июня по август\") — "
+        "month=более ранний, month_to=более поздний. period_type всё равно "
+        "specific_month. Обычный вопрос про один месяц — month_to=null, не путай "
+        "с month."
     )
     try:
         completion = client.chat.completions.create(
