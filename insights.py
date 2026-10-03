@@ -221,6 +221,18 @@ def resolve_period(period_type: str, month: int | None, year: int | None,
 
         return since, until, label
 
+    if period_type == "specific_year":
+        # Раньше такого типа периода не было вообще — "за 2026 год" без
+        # названного месяца физически некуда было деть ни в один из
+        # прежних 4 вариантов (specific_month ждёт месяц, all_time
+        # игнорирует год целиком), и модель не могла собрать валидный
+        # ответ — полный отказ "Не понял вопрос" вместо ответа по году.
+        now = datetime.now(timezone.utc)
+        actual_year = year or now.year
+        since, _ = month_bounds(actual_year, 1)
+        _, until = month_bounds(actual_year, 12)
+        return since, until, str(actual_year)
+
     if period_type == "current_period":
         since = period_start(month_start_day)
         return since, None, "текущий период"
@@ -274,6 +286,13 @@ def resolve_previous_period(period_type: str, month: int | None, year: int | Non
                         f"{MONTH_NAMES.get(prev_month_to, prev_month_to)} {prev_year_to}")
 
         return since, until, label
+
+    if period_type == "specific_year":
+        now = datetime.now(timezone.utc)
+        actual_year = (year or now.year) - 1
+        since, until = month_bounds(actual_year, 1)
+        _, until = month_bounds(actual_year, 12)
+        return since, until, str(actual_year)
 
     if period_type == "current_period":
         since = period_start(month_start_day)
@@ -359,7 +378,10 @@ async def _answer_question_inner(user_id: int, text: str) -> str:
     # last_date без названного месяца — вся история. Месяц/«в этом месяце»
     # названы — уважаем диапазон, а не игнорируем его.
     if intent == "last_date":
-        use_range = period_type in ("specific_month", "calendar_month", "this_month") or parsed.get("month")
+        use_range = (
+            period_type in ("specific_month", "calendar_month", "this_month", "specific_year")
+            or parsed.get("month")
+        )
         return await _answer_last_date(
             user_id, account, parsed.get("car_name"),
             parsed.get("category"), parsed.get("item"), text,

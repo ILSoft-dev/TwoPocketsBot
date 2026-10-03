@@ -23,6 +23,7 @@ os.environ.setdefault("GROQ_API_KEY", "dummy")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 
 from config import forced_category, looks_like_question
+import insights
 import auto_expense
 import cars
 from tx_logic import (
@@ -53,6 +54,41 @@ def test_forced_category():
     assert forced_category("ремонт квартиры 200р") is None
     assert forced_category("такси до вокзала") == "Транспорт"
     assert forced_category("кофе") is None
+
+
+def test_resolve_period_month_range():
+    # Год везде указан явно — иначе resolve_year_for_month смотрит на
+    # реальное "сейчас" и тест стал бы зависеть от даты запуска.
+    since, until, label = insights.resolve_period("specific_month", 8, 2026, 1, month_to=9)
+    assert (since.year, since.month, since.day) == (2026, 8, 1)
+    assert (until.year, until.month, until.day) == (2026, 9, 30)
+    assert "август" in label.lower() and "сентябрь" in label.lower()
+
+    # без month_to — одномесячный случай не меняется
+    since2, until2, label2 = insights.resolve_period("specific_month", 9, 2026, 1)
+    assert (since2.year, since2.month) == (2026, 9)
+    assert (until2.year, until2.month) == (2026, 9)
+    assert label2 == "сентябрь 2026"
+
+    # перенос через год: "декабрь и январь"
+    since3, until3, _ = insights.resolve_period("specific_month", 12, 2025, 1, month_to=1)
+    assert since3.year == 2025 and since3.month == 12
+    assert until3.year == 2026 and until3.month == 1
+
+    # сравнение с предыдущим диапазоном той же длины (2 месяца, не 1)
+    psince, puntil, _ = insights.resolve_previous_period("specific_month", 8, 2026, 1, month_to=9)
+    assert psince.year == 2026 and psince.month == 6
+    assert puntil.year == 2026 and puntil.month == 7
+
+
+def test_resolve_period_specific_year():
+    since, until, label = insights.resolve_period("specific_year", None, 2026, 1)
+    assert (since.year, since.month, since.day) == (2026, 1, 1)
+    assert (until.year, until.month, until.day) == (2026, 12, 31)
+    assert label == "2026"
+
+    psince, puntil, plabel = insights.resolve_previous_period("specific_year", None, 2026, 1)
+    assert plabel == "2025" and psince.year == 2025 and puntil.year == 2025
 
 
 def test_classify_auto_type():
@@ -303,6 +339,8 @@ def test_ru_plural_boundaries():
 
 if __name__ == "__main__":
     test_forced_category()
+    test_resolve_period_month_range()
+    test_resolve_period_specific_year()
     test_classify_auto_type()
     test_car_name_aliases()
     test_clean_description()

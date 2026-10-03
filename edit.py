@@ -199,13 +199,19 @@ async def edit_month_page(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("edit_pick:"))
 async def edit_pick(callback: CallbackQuery, state: FSMContext):
+    # Безопасная ТОЧКА ВХОДА — не требует предыдущего состояния: список
+    # /edit сам по себе без-стейтовый (браузинг), и повторный клик по
+    # СТАРОЙ кнопке записи из списка — легитимное действие ("хочу снова
+    # поправить вот эту трату"), не баг. Защита нужна дальше по цепочке,
+    # где уже есть что потерять (см. choosing_field/choosing_category).
     row_id = callback.data.split(":", 1)[1]
+    await state.set_state(EditStates.choosing_field)
     await state.update_data(edit_row_id=row_id)
     await callback.message.edit_text("Что поменять?", reply_markup=_field_choice_keyboard())
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("edit_field:"))
+@router.callback_query(F.data.startswith("edit_field:"), EditStates.choosing_field)
 async def edit_field_choice(callback: CallbackQuery, state: FSMContext):
     field = callback.data.split(":", 1)[1]
 
@@ -222,11 +228,21 @@ async def edit_field_choice(callback: CallbackQuery, state: FSMContext):
         return
 
     if field == "category":
+        await state.set_state(EditStates.choosing_category)
         user = db.get_or_create_user(callback.from_user.id, callback.from_user.username)
         categories = [c["name"] for c in await asyncio.to_thread(db.get_categories, user["id"])]
         await callback.message.edit_text("Какая категория?", reply_markup=_category_keyboard(categories))
         await callback.answer()
         return
+
+
+@router.callback_query(F.data.startswith("edit_field:"))
+async def edit_field_choice_stale(callback: CallbackQuery) -> None:
+    """Та же кнопка "Дата/Сумма/Категория", но сессия /edit уже не активна
+    (успешно завершилась раньше, истекла, или это вообще кнопка от другой,
+    давно прошедшей сессии) — явно говорим об этом, а не тихо роняем клик
+    или правим что-то наугад с пустыми/чужими данными состояния."""
+    await callback.answer("Эта сессия /edit уже неактуальна. Начни заново: /edit", show_alert=True)
 
 
 async def _apply_field_update(reply_target: Message, state: FSMContext, tg_user: User,
@@ -304,7 +320,7 @@ async def edit_new_amount(message: Message, state: FSMContext):
     )
 
 
-@router.callback_query(F.data.startswith("edit_cat_choice:"))
+@router.callback_query(F.data.startswith("edit_cat_choice:"), EditStates.choosing_category)
 async def edit_category_chosen(callback: CallbackQuery, state: FSMContext):
     category = callback.data.split(":", 1)[1]
     await _apply_field_update(
@@ -316,11 +332,26 @@ async def edit_category_chosen(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.callback_query(F.data == "edit_cat_choice_new")
+@router.callback_query(F.data.startswith("edit_cat_choice:"))
+async def edit_category_chosen_stale(callback: CallbackQuery) -> None:
+    """См. edit_field_choice_stale — тот же принцип: клавиатура выбора
+    категории от уже неактивной сессии, явный ответ вместо правки наугад.
+    Именно сюда попал реальный случай: клик по старой кнопке "Продукты" от
+    сессии часовой давности между делом привёл к "Не нашёл эту запись" —
+    потому что state уже не содержал нужного row_id для ЭТОЙ кнопки."""
+    await callback.answer("Эта сессия /edit уже неактуальна. Начни заново: /edit", show_alert=True)
+
+
+@router.callback_query(F.data == "edit_cat_choice_new", EditStates.choosing_category)
 async def edit_category_new_prompt(callback: CallbackQuery, state: FSMContext):
     await state.set_state(EditStates.waiting_new_category_name)
     await callback.message.edit_text("Как назвать категорию?")
     await callback.answer()
+
+
+@router.callback_query(F.data == "edit_cat_choice_new")
+async def edit_category_new_prompt_stale(callback: CallbackQuery) -> None:
+    await callback.answer("Эта сессия /edit уже неактуальна. Начни заново: /edit", show_alert=True)
 
 
 @router.message(EditStates.waiting_new_category_name)
