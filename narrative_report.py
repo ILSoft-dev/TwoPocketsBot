@@ -47,7 +47,7 @@ import redis.asyncio as redis_asyncio
 import supabase_client as db
 import groq_client
 import tx_logic
-from config import REDIS_URL
+from config import REDIS_URL, CRON_ACCOUNT_PAUSE_SECONDS
 from sheets_transactions import (
     get_transactions_in_range,
     get_transactions_in_range_for_account,
@@ -254,6 +254,8 @@ async def run_annual_report_sweep(bot) -> int:
         except Exception:
             pass
 
+        await asyncio.sleep(CRON_ACCOUNT_PAUSE_SECONDS)  # не бить Google/Groq веером при многих аккаунтах
+
     return sent
 
 
@@ -349,6 +351,8 @@ async def run_period_notes_sweep(bot) -> int:
             await _mark_sent_period_notes(account["id"], period_label)
         except Exception:
             pass
+
+        await asyncio.sleep(CRON_ACCOUNT_PAUSE_SECONDS)  # не бить Google/Groq веером при многих аккаунтах
 
     return sent
 

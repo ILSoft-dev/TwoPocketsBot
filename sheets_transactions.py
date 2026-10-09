@@ -47,11 +47,29 @@ import supabase_client as db
 import sheets_client as sc
 import google_api
 import tx_logic
+from config import CRON_ACCOUNT_PAUSE_SECONDS
 from sheets_client import to_float  # re-exported: history.py/undo.py use tx.to_float
 
 STATUS_ACTIVE = tx_logic.STATUS_ACTIVE
 STATUS_DELETED = tx_logic.STATUS_DELETED
 logger = logging.getLogger(__name__)
+
+# Заезд E: два писателя в ОДНУ таблицу почти одновременно (семья из 2+ —
+# оба отправили трату в один момент) могли бы оба пройти дедуп-проверку
+# ДО того, как любой из них допишет строку, и оба записать. Лок по
+# spreadsheet_id (в рамках ОДНОГО процесса — большего пока не нужно, см.
+# ТЗ "не переносить source of truth в Postgres") сериализует
+# append+mirror_upsert для одной и той же таблицы, не трогая другие —
+# разные семьи пишут параллельно без оглядки друг на друга.
+_spreadsheet_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for_spreadsheet(spreadsheet_id: str) -> asyncio.Lock:
+    lock = _spreadsheet_locks.get(spreadsheet_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _spreadsheet_locks[spreadsheet_id] = lock
+    return lock
 
 
 class NoGoogleAccount(Exception):
@@ -171,34 +189,36 @@ async def save_transaction(user_id: int, who: str, amount: float, tx_type: str,
     с датами месячной давности)."""
     account = _get_account(user_id)
     effective_now = override_datetime or datetime.now(timezone.utc)
-    try:
-        existing = await _all_tx_rows_for_account(account)
-        dup = tx_logic.find_recent_duplicate(existing, who, amount, comment or "", now=effective_now)
-        if dup:
-            return dup.get("ID") or ""
-    except Exception:
-        logger.exception("save_transaction: duplicate check failed, writing anyway")
 
-    now = effective_now.isoformat()  # считаем один раз — раньше sc.now_iso()
-                                      # вызывался дважды (запись + зеркало) и
-                                      # мог тихо разойтись на миллисекунды
-    box = google_api.TokenBox(account)
-    async with sc.new_session() as session:
-        async def _do(token):
-            return await sc.append_row(
-                session, token, account["google_spreadsheet_id"], sc.SHEET_TRANSACTIONS,
-                [now, who, tx_type, category, amount, source, comment, STATUS_ACTIVE,
-                 quantity if quantity is not None else "", unit or ""],
-            )
-        row_id = await google_api.call(box, _do)
+    async with _lock_for_spreadsheet(account["google_spreadsheet_id"]):
+        try:
+            existing = await _all_tx_rows_for_account(account)
+            dup = tx_logic.find_recent_duplicate(existing, who, amount, comment or "", now=effective_now)
+            if dup:
+                return dup.get("ID") or ""
+        except Exception:
+            logger.exception("save_transaction: duplicate check failed, writing anyway")
 
-    await asyncio.to_thread(db.mirror_upsert_row, account["id"], {
-        "ID": row_id, "Дата и время": now, "Кто": who, "Тип": tx_type,
-        "Категория": category, "Сумма": amount, "Источник": source,
-        "Комментарий": comment, "Статус": STATUS_ACTIVE,
-        "Количество": quantity if quantity is not None else "", "Единица": unit or "",
-    })
-    return row_id
+        now = effective_now.isoformat()  # считаем один раз — раньше sc.now_iso()
+                                          # вызывался дважды (запись + зеркало) и
+                                          # мог тихо разойтись на миллисекунды
+        box = google_api.TokenBox(account)
+        async with sc.new_session() as session:
+            async def _do(token):
+                return await sc.append_row(
+                    session, token, account["google_spreadsheet_id"], sc.SHEET_TRANSACTIONS,
+                    [now, who, tx_type, category, amount, source, comment, STATUS_ACTIVE,
+                     quantity if quantity is not None else "", unit or ""],
+                )
+            row_id = await google_api.call(box, _do)
+
+        await asyncio.to_thread(db.mirror_upsert_row, account["id"], {
+            "ID": row_id, "Дата и время": now, "Кто": who, "Тип": tx_type,
+            "Категория": category, "Сумма": amount, "Источник": source,
+            "Комментарий": comment, "Статус": STATUS_ACTIVE,
+            "Количество": quantity if quantity is not None else "", "Единица": unit or "",
+        })
+        return row_id
 
 
 async def save_auto_expense(user_id: int, who: str, amount: float, tx_type: str,
@@ -213,65 +233,67 @@ async def save_auto_expense(user_id: int, who: str, amount: float, tx_type: str,
     save_transaction выше, тот же смысл и для дедуп-проверки."""
     account = _get_account(user_id)
     effective_now = override_datetime or datetime.now(timezone.utc)
-    try:
-        existing = await _all_tx_rows_for_account(account)
-        dup = tx_logic.find_recent_duplicate(existing, who, amount, description or "", now=effective_now)
-        if dup:
-            return dup.get("ID") or "", ""
-    except Exception:
-        logger.exception("save_auto_expense: duplicate check failed, writing anyway")
 
-    tx_id = sc.new_row_id()
-    auto_id = sc.new_row_id()
-    mileage_id = sc.new_row_id() if mileage is not None else None
-    box = google_api.TokenBox(account)
-    sid = account["google_spreadsheet_id"]
-    now = effective_now.isoformat()
-    # Категория в "Транзакции" — сам auto_type (Топливо/Ремонт-ТО/Запчасти/
-    # Прочее), не фиксированная "Авто" — раньше все авто-траты писались в
-    # одну общую категорию независимо от типа; теперь классификатор решает
-    # финальную категорию сразу, а не только метку в служебном листе "Авто".
-    async with sc.new_session() as session:
-        async def _do_tx(token):
-            if await sc.row_id_exists(session, token, sid, sc.SHEET_TRANSACTIONS, tx_id):
-                return tx_id
-            return await sc.append_row(
-                session, token, sid, sc.SHEET_TRANSACTIONS,
-                [now, who, tx_type, auto_type, amount, source, description, STATUS_ACTIVE,
-                 quantity if quantity is not None else "", unit or ""],
-                row_id=tx_id,
-            )
-        tx_id = await google_api.call(box, _do_tx)
+    async with _lock_for_spreadsheet(account["google_spreadsheet_id"]):
+        try:
+            existing = await _all_tx_rows_for_account(account)
+            dup = tx_logic.find_recent_duplicate(existing, who, amount, description or "", now=effective_now)
+            if dup:
+                return dup.get("ID") or "", ""
+        except Exception:
+            logger.exception("save_auto_expense: duplicate check failed, writing anyway")
 
-        async def _do_auto(token):
-            if await sc.row_id_exists(session, token, sid, sc.SHEET_AUTO, auto_id):
-                return auto_id
-            return await sc.append_row(
-                session, token, sid, sc.SHEET_AUTO,
-                [now, car_name, auto_type, description, amount, mileage or "", who, STATUS_ACTIVE,
-                 quantity if quantity is not None else "", unit or ""],
-                row_id=auto_id,
-            )
-        auto_id = await google_api.call(box, _do_auto)
-
-        if mileage_id is not None:
-            async def _do_mileage(token):
-                if await sc.row_id_exists(session, token, sid, sc.SHEET_MILEAGE, mileage_id):
-                    return mileage_id
+        tx_id = sc.new_row_id()
+        auto_id = sc.new_row_id()
+        mileage_id = sc.new_row_id() if mileage is not None else None
+        box = google_api.TokenBox(account)
+        sid = account["google_spreadsheet_id"]
+        now = effective_now.isoformat()
+        # Категория в "Транзакции" — сам auto_type (Топливо/Ремонт-ТО/Запчасти/
+        # Прочее), не фиксированная "Авто" — раньше все авто-траты писались в
+        # одну общую категорию независимо от типа; теперь классификатор решает
+        # финальную категорию сразу, а не только метку в служебном листе "Авто".
+        async with sc.new_session() as session:
+            async def _do_tx(token):
+                if await sc.row_id_exists(session, token, sid, sc.SHEET_TRANSACTIONS, tx_id):
+                    return tx_id
                 return await sc.append_row(
-                    session, token, sid, sc.SHEET_MILEAGE,
-                    [now, car_name, mileage, "Из авто-траты", who],
-                    row_id=mileage_id,
+                    session, token, sid, sc.SHEET_TRANSACTIONS,
+                    [now, who, tx_type, auto_type, amount, source, description, STATUS_ACTIVE,
+                     quantity if quantity is not None else "", unit or ""],
+                    row_id=tx_id,
                 )
-            await google_api.call(box, _do_mileage)
+            tx_id = await google_api.call(box, _do_tx)
 
-    await asyncio.to_thread(db.mirror_upsert_row, account["id"], {
-        "ID": tx_id, "Дата и время": now, "Кто": who, "Тип": tx_type,
-        "Категория": auto_type, "Сумма": amount, "Источник": source,
-        "Комментарий": description, "Статус": STATUS_ACTIVE,
-        "Количество": quantity if quantity is not None else "", "Единица": unit or "",
-    })
-    return tx_id, auto_id
+            async def _do_auto(token):
+                if await sc.row_id_exists(session, token, sid, sc.SHEET_AUTO, auto_id):
+                    return auto_id
+                return await sc.append_row(
+                    session, token, sid, sc.SHEET_AUTO,
+                    [now, car_name, auto_type, description, amount, mileage or "", who, STATUS_ACTIVE,
+                     quantity if quantity is not None else "", unit or ""],
+                    row_id=auto_id,
+                )
+            auto_id = await google_api.call(box, _do_auto)
+
+            if mileage_id is not None:
+                async def _do_mileage(token):
+                    if await sc.row_id_exists(session, token, sid, sc.SHEET_MILEAGE, mileage_id):
+                        return mileage_id
+                    return await sc.append_row(
+                        session, token, sid, sc.SHEET_MILEAGE,
+                        [now, car_name, mileage, "Из авто-траты", who],
+                        row_id=mileage_id,
+                    )
+                await google_api.call(box, _do_mileage)
+
+        await asyncio.to_thread(db.mirror_upsert_row, account["id"], {
+            "ID": tx_id, "Дата и время": now, "Кто": who, "Тип": tx_type,
+            "Категория": auto_type, "Сумма": amount, "Источник": source,
+            "Комментарий": description, "Статус": STATUS_ACTIVE,
+            "Количество": quantity if quantity is not None else "", "Единица": unit or "",
+        })
+        return tx_id, auto_id
 
 
 async def save_mileage_point(user_id: int, who: str, car_name: str, mileage: float,
@@ -487,4 +509,5 @@ async def run_mirror_reconcile_sweep() -> int:
                 fixed += 1
         except Exception:
             logger.exception("run_mirror_reconcile_sweep: account %s failed", owner_id)
+        await asyncio.sleep(CRON_ACCOUNT_PAUSE_SECONDS)  # не бить Google веером при многих аккаунтах
     return fixed

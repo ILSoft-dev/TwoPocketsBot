@@ -19,6 +19,7 @@ naturally staggers reminders across multiple cars without any extra
 scheduling logic; no need to hand-pick different times per car.
 """
 from datetime import datetime, timedelta, timezone
+import asyncio
 
 import aiohttp
 
@@ -26,6 +27,7 @@ import supabase_client as db
 import sheets_client as sc
 import cars
 import google_api
+from config import CRON_ACCOUNT_PAUSE_SECONDS
 from keyboards import mileage_reminder_keyboard
 
 REMINDER_INTERVAL_DAYS = 7
@@ -57,6 +59,7 @@ async def run_reminder_sweep(bot) -> int:
 
     for account in db.list_google_connected_users():
         active_cars = await cars.list_active_cars(account)
+        await asyncio.sleep(CRON_ACCOUNT_PAUSE_SECONDS)  # не бить Google веером при многих аккаунтах
         due_cars = [c for c in active_cars if _due(c)]
         if not due_cars:
             continue

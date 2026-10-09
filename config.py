@@ -35,6 +35,19 @@ GOOGLE_HTTP_TIMEOUT_SECONDS = int(os.getenv("GOOGLE_HTTP_TIMEOUT_SECONDS", "20")
 # без паузы, дальше нарастающая задержка. 4 записи = максимум 3 повтора.
 GOOGLE_TRANSIENT_RETRY_DELAYS = [0, 1, 2, 4]
 
+# Заезд E (нагрузка от 3+ семей/активного параллельного использования —
+# пока не нужно, но дёшево сделать сразу, чтобы не искать по памяти через
+# месяц): пауза между аккаунтами в ежедневных/периодических sweep'ах
+# (reminders/car_stats/narrative_report/mirror-сверка) — не бить Google/Groq
+# веером, если аккаунтов много. Не на каждый /report, только на cron.
+CRON_ACCOUNT_PAUSE_SECONDS = float(os.getenv("CRON_ACCOUNT_PAUSE_SECONDS", "0.3"))
+
+# Простой in-process лимит на одновременные вызовы Groq (без отдельной
+# очереди в Redis — для одного Render-инстанса этого достаточно). Если все
+# N заняты, следующий вызов просто ждёт своей очереди (threading.Semaphore
+# в groq_client.py), а не падает и не шлёт лишние запросы разом.
+GROQ_MAX_CONCURRENT = int(os.getenv("GROQ_MAX_CONCURRENT", "3"))
+
 # Google OAuth — тот же Client ID/Secret, что уже настроен для PixKeep
 # (Google Cloud проект + OAuth-клиент общие, это разные приложения на одном
 # клиенте, не наоборот). Подтверждено: drive.file покрывает ВСЕ нужные

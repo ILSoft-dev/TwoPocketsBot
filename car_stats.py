@@ -10,6 +10,7 @@ Two consumers:
   everyone who shares that spreadsheet (owner + family members).
 """
 from datetime import datetime, timedelta, timezone
+import asyncio
 
 import aiohttp
 
@@ -17,6 +18,7 @@ import supabase_client as db
 import sheets_client as sc
 import cars
 import google_api
+from config import CRON_ACCOUNT_PAUSE_SECONDS
 from report import period_start
 from period_utils import is_period_end_today
 
@@ -113,6 +115,7 @@ async def run_monthly_stats_sweep(bot) -> int:
             continue
 
         active_cars = await cars.list_active_cars(account)
+        await asyncio.sleep(CRON_ACCOUNT_PAUSE_SECONDS)  # не бить Google веером при многих аккаунтах
         if not active_cars:
             continue
 

@@ -10,6 +10,13 @@
 - extract_receipt_total — Vision (qwen3.6-27b), фото чека -> сумма
 
 Changelog:
+- v1.13: Заезд E (нагрузка) — простой in-process лимит на одновременные
+        вызовы Groq (_rate_limited/_groq_semaphore, GROQ_MAX_CONCURRENT в
+        config.py, по умолчанию 3). Не очередь в Redis — для одного
+        Render-инстанса достаточно threading.Semaphore вокруг каждого
+        синхронного Groq-вызова; при превышении лимита следующий вызов
+        просто ждёт своей очереди в потоке (asyncio.to_thread), не падает
+        и не шлёт лишние запросы разом.
 - v1.12: period_type получил specific_year — "за 2026 год" без месяца не
         ложился ни в один из прежних 4 вариантов (specific_month ждёт
         месяц, all_time игнорирует год) и давал полный отказ разбора,
@@ -95,13 +102,15 @@ Changelog:
         без **kwargs) и упала бы с TypeError.
 """
 import base64
+import functools
 import json
 import logging
 import os
 import re
+import threading
 from groq import Groq
 
-from config import GROQ_API_KEY
+from config import GROQ_API_KEY, GROQ_MAX_CONCURRENT
 
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -114,6 +123,21 @@ client = Groq(api_key=GROQ_API_KEY)
 TEXT_MODEL = os.getenv("GROQ_TEXT_MODEL", "openai/gpt-oss-20b")
 VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.6-27b")
 WHISPER_MODEL = os.getenv("GROQ_WHISPER_MODEL", "whisper-large-v3")
+
+# Заезд E: простой in-process лимит одновременных вызовов Groq (ТЗ 2.2) —
+# не больше GROQ_MAX_CONCURRENT сразу, остальные ждут своей очереди.
+# threading.Semaphore, не asyncio.Semaphore — все функции здесь синхронные
+# и вызываются через asyncio.to_thread (в отдельном потоке), а не из event
+# loop напрямую, так что это обычная блокировка потока, не корутины.
+_groq_semaphore = threading.Semaphore(GROQ_MAX_CONCURRENT)
+
+
+def _rate_limited(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _groq_semaphore:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 class GroqUnavailable(Exception):
@@ -143,6 +167,7 @@ def _log_groq_failure(context: str, model: str, exc: Exception) -> None:
         logging.exception(f"{context}: Groq request failed")
 
 
+@_rate_limited
 def categorize_text(remainder_text: str, categories: list[str]) -> str:
     prompt = (
         f"Определи наиболее подходящую категорию из списка: {', '.join(categories)}.\n"
@@ -170,6 +195,7 @@ def categorize_text(remainder_text: str, categories: list[str]) -> str:
     return "Разное"
 
 
+@_rate_limited
 def narrate_period_comparison(data_summary: str) -> str:
     """Оборачивает УЖЕ ПОСЧИТАННЫЕ Python-ом числа (см. narrative_report.py)
     в связный текст на пару предложений. Модель здесь ничего не считает и
@@ -206,6 +232,7 @@ def narrate_period_comparison(data_summary: str) -> str:
     return response.choices[0].message.content.strip()
 
 
+@_rate_limited
 def narrate_period_notes(data_summary: str) -> str:
     """Как narrate_period_comparison выше, но для СТРУКТУРНЫХ ЗАМЕТОК за
     один период (форма категории, скрытые визиты, регулярность привычки,
@@ -253,6 +280,7 @@ def narrate_period_notes(data_summary: str) -> str:
     return response.choices[0].message.content.strip()
 
 
+@_rate_limited
 def transcribe_voice(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
     try:
         transcription = client.audio.transcriptions.create(
@@ -266,6 +294,7 @@ def transcribe_voice(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
     return transcription.text.strip()
 
 
+@_rate_limited
 def parse_question(text: str, categories: list[str], car_names: list[str],
                    previous: dict | None = None) -> dict | None:
     """Разбирает вопрос типа 'сколько я потратил на корм в июне?' в структуру:
@@ -508,6 +537,7 @@ def parse_question(text: str, categories: list[str], car_names: list[str],
 MAX_CLUSTER_ITEMS = 200
 
 
+@_rate_limited
 def cluster_items(comments: list[str]) -> dict[str, str] | None:
     """Группирует похожие по смыслу описания трат в компактный набор
     канонических названий товара — "молоко", "молоко 2.5%", "молочко" все
@@ -591,6 +621,7 @@ def cluster_items(comments: list[str]) -> dict[str, str] | None:
     return grouping
 
 
+@_rate_limited
 def extract_receipt_total(image_bytes: bytes) -> float | None:
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     prompt = (
