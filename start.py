@@ -31,6 +31,7 @@ HELP_TEXT = (
     "Команды:\n"
     "/report — сводка за период\n"
     "/history — последние траты\n"
+    "/today — записи за сегодня\n"
     "/categories — свои категории\n"
     "/family — семейный бюджет\n"
     "/undo — отменить последнюю запись\n"
@@ -121,7 +122,7 @@ async def choose_month_start(message: Message, state: FSMContext):
 @router.callback_query(OnboardingStates.waiting_cash_on_hand, F.data == "skip_cash")
 async def skip_cash(callback: CallbackQuery, state: FSMContext):
     await state.update_data(cash_on_hand=None)
-    await ask_google_connect(callback.message, state)
+    await ask_google_connect(callback.message, state, callback.from_user.id, callback.from_user.username)
     await callback.answer()
 
 
@@ -135,13 +136,22 @@ async def enter_cash(message: Message, state: FSMContext):
         return
 
     await state.update_data(cash_on_hand=amount)
-    await ask_google_connect(message, state)
+    await ask_google_connect(message, state, message.from_user.id, message.from_user.username)
 
 
-async def ask_google_connect(message: Message, state: FSMContext):
-    user = db.get_or_create_user(message.chat.id, message.chat.username)
+async def ask_google_connect(message: Message, state: FSMContext, tg_id: int, username: str | None):
+    """tg_id/username переданы явно, а не взяты из message.chat.* — эта
+    функция вызывается и из обычного message-хендлера (enter_cash), и из
+    callback-хендлера (skip_cash), где message — это callback.message
+    (СВОЁ, бот-сообщение с кнопками). message.chat.id/username у приватного
+    чата совпадали бы с tg_id/username пользователя (Telegram это
+    гарантирует для 1:1 чатов), но message.from_user в callback-ветке был
+    бы ботом, а не пользователем — поэтому идентичность передаём явно из
+    callback.from_user/message.from_user на стороне вызывающего, а не
+    гадаем здесь."""
+    user = db.get_or_create_user(tg_id, username)
     await state.set_state(OnboardingStates.waiting_google_connect)
-    auth_url = await build_auth_url(user_id=user["id"], tg_id=message.chat.id)
+    auth_url = await build_auth_url(user_id=user["id"], tg_id=tg_id)
     await message.answer(
         "Теперь подключи свой Google Drive — туда будут сохраняться все "
         "траты и доходы (не в базу разработчика, а прямо на твой личный "
@@ -186,7 +196,7 @@ async def ask_cars_intro(bot, chat_id: int, state: FSMContext):
 @router.callback_query(OnboardingStates.waiting_cars_intro, F.data == "car_skip")
 @router.callback_query(OnboardingStates.waiting_add_another_car, F.data == "car_done")
 async def cars_done(callback: CallbackQuery, state: FSMContext):
-    await finish_onboarding(callback.message, state)
+    await finish_onboarding(callback.message, state, callback.from_user.id, callback.from_user.username)
     await callback.answer()
 
 
@@ -218,7 +228,10 @@ async def car_name_entered(message: Message, state: FSMContext):
 
 @router.callback_query(OnboardingStates.waiting_car_mileage, F.data == "skip_car_mileage")
 async def car_mileage_skipped(callback: CallbackQuery, state: FSMContext):
-    await save_car_and_continue(callback.message, state, mileage=None)
+    await save_car_and_continue(
+        callback.message, state, mileage=None,
+        tg_id=callback.from_user.id, username=callback.from_user.username,
+    )
     await callback.answer()
 
 
@@ -228,19 +241,23 @@ async def car_mileage_entered(message: Message, state: FSMContext):
     if mileage is None:
         await message.answer("Не вижу числа — введи пробег цифрами или нажми «Пропустить».")
         return
-    await save_car_and_continue(message, state, mileage=mileage)
+    await save_car_and_continue(
+        message, state, mileage=mileage,
+        tg_id=message.from_user.id, username=message.from_user.username,
+    )
 
 
-async def save_car_and_continue(message: Message, state: FSMContext, mileage: float | None):
+async def save_car_and_continue(message: Message, state: FSMContext, mileage: float | None,
+                                tg_id: int, username: str | None):
     data = await state.get_data()
     name = data["pending_car_name"]
-    user = db.get_or_create_user(message.chat.id, message.chat.username)
+    user = db.get_or_create_user(tg_id, username)
     account = db.get_google_account(user["id"])
 
     if account:
         try:
             await cars.add_car(
-                account, name, who=message.chat.username or str(message.chat.id),
+                account, name, who=username or str(tg_id),
                 starting_mileage=mileage,
             )
             await message.answer(f"«{name}» добавлена ✅")
@@ -262,9 +279,9 @@ async def save_car_and_continue(message: Message, state: FSMContext, mileage: fl
     await message.answer("Добавить ещё одну машину?", reply_markup=add_another_car_keyboard())
 
 
-async def finish_onboarding(message: Message, state: FSMContext):
+async def finish_onboarding(message: Message, state: FSMContext, tg_id: int, username: str | None):
     data = await state.get_data()
-    user = db.get_or_create_user(message.chat.id, message.chat.username)
+    user = db.get_or_create_user(tg_id, username)
     db.finish_onboarding(
         user_id=user["id"],
         currency=data["currency"],

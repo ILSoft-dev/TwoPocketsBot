@@ -32,6 +32,7 @@ import backdate
 import start
 import report
 import history
+import today
 import categories
 import family
 import settings
@@ -50,6 +51,7 @@ BOT_COMMANDS = [
     BotCommand(command="guide", description="📖 Подробная инструкция"),
     BotCommand(command="report", description="📊 Сводка за период"),
     BotCommand(command="history", description="🧾 История операций"),
+    BotCommand(command="today", description="📅 Записи за сегодня"),
     BotCommand(command="undo", description="↩️ Отменить свою последнюю запись"),
     BotCommand(command="categories", description="📁 Список категорий, добавить свою"),
     BotCommand(command="family", description="👨‍👩‍👧 Семейный бюджет"),
@@ -167,6 +169,7 @@ async def main():
     dp.include_router(start.router)
     dp.include_router(report.router)
     dp.include_router(history.router)
+    dp.include_router(today.router)
     dp.include_router(categories.router)
     dp.include_router(family.router)
     dp.include_router(settings.router)
